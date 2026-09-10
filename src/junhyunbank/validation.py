@@ -22,9 +22,16 @@ def net_round_trip_return(
     values = (entry_ask, future_bid, bid_fee, ask_fee)
     if any(not math.isfinite(float(value)) for value in values):
         return None
-    if entry_ask <= 0 or future_bid <= 0 or not (0 <= bid_fee < 1) or not (0 <= ask_fee < 1):
+    if (
+        entry_ask <= 0
+        or future_bid <= 0
+        or not (0 <= bid_fee < 1)
+        or not (0 <= ask_fee < 1)
+    ):
         return None
-    return (future_bid * (1.0 - ask_fee)) / (entry_ask * (1.0 + bid_fee)) - 1.0
+    return (future_bid * (1.0 - ask_fee)) / (
+        entry_ask * (1.0 + bid_fee)
+    ) - 1.0
 
 
 def absolute_mid_move(
@@ -34,7 +41,10 @@ def absolute_mid_move(
     future_ask: float,
 ) -> float | None:
     values = (entry_bid, entry_ask, future_bid, future_ask)
-    if any(not math.isfinite(float(value)) or float(value) <= 0 for value in values):
+    if any(
+        not math.isfinite(float(value)) or float(value) <= 0
+        for value in values
+    ):
         return None
     entry_mid = (entry_bid + entry_ask) / 2.0
     future_mid = (future_bid + future_ask) / 2.0
@@ -72,6 +82,22 @@ def _finite_float(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _created_epoch_ms(row: dict[str, Any]) -> float:
+    value = _finite_float(row.get("created_epoch_ms"))
+    return value if value is not None else 0.0
+
+
+def _ordered(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            _created_epoch_ms(row),
+            str(row.get("market") or ""),
+            str(row.get("sample_id") or ""),
+        ),
+    )
+
+
 def summarize_labeled_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Summarize already-labeled shadow observations without fitting a model.
 
@@ -86,11 +112,19 @@ def summarize_labeled_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         expected = _finite_float(row.get("expected_move_pct"))
         if net is None or move is None:
             continue
-        normalized.append((net, move, expected if expected is not None and expected > 0 else None))
+        normalized.append(
+            (
+                net,
+                move,
+                expected if expected is not None and expected > 0 else None,
+            )
+        )
 
     net_values = [row[0] for row in normalized]
     moves = [row[1] for row in normalized]
-    expected_pairs = [(row[2], row[1]) for row in normalized if row[2] is not None]
+    expected_pairs = [
+        (row[2], row[1]) for row in normalized if row[2] is not None
+    ]
     expected_values = [float(pair[0]) for pair in expected_pairs]
     expected_moves = [pair[1] for pair in expected_pairs]
     calibration_ratios = [
@@ -112,7 +146,9 @@ def summarize_labeled_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "mean_absolute_mid_move": _mean(moves),
         "median_absolute_mid_move": _median(moves),
         "mean_expected_move": _mean(expected_values),
-        "expected_move_abs_correlation": _pearson(expected_values, expected_moves),
+        "expected_move_abs_correlation": _pearson(
+            expected_values, expected_moves
+        ),
         "expected_move_coverage_rate": (
             sum(coverage) / len(coverage) if coverage else None
         ),
@@ -123,18 +159,46 @@ def summarize_labeled_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
 def chronological_split(
     rows: Iterable[dict[str, Any]], fraction: float = 0.60
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    ordered = sorted(
-        rows,
-        key=lambda row: (
-            float(row.get("created_epoch_ms") or 0.0),
-            str(row.get("market") or ""),
-        ),
-    )
+    """Chronologically split observations without shuffling.
+
+    This generic helper does not purge overlapping forward labels. Use
+    :func:`purged_chronological_split` for time-series validation metrics.
+    """
+    ordered = _ordered(rows)
     if not ordered:
         return [], []
     fraction = max(0.05, min(0.95, float(fraction)))
-    cut = max(1, min(len(ordered) - 1, int(len(ordered) * fraction))) if len(ordered) > 1 else 1
+    cut = (
+        max(1, min(len(ordered) - 1, int(len(ordered) * fraction)))
+        if len(ordered) > 1
+        else 1
+    )
     return ordered[:cut], ordered[cut:]
+
+
+def purged_chronological_split(
+    rows: Iterable[dict[str, Any]],
+    *,
+    horizon_seconds: float,
+    fraction: float = 0.60,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Chronological split with a forward-label purge gap.
+
+    A training observation is removed when its label horizon reaches into the
+    holdout period. This prevents a training label from using the same future
+    price interval that belongs to the beginning of the holdout set.
+    """
+    train, holdout = chronological_split(rows, fraction)
+    if not train or not holdout:
+        return train, holdout
+    horizon_ms = max(0.0, float(horizon_seconds)) * 1000.0
+    holdout_start = _created_epoch_ms(holdout[0])
+    purged_train = [
+        row
+        for row in train
+        if _created_epoch_ms(row) + horizon_ms < holdout_start
+    ]
+    return purged_train, holdout
 
 
 def _sample_expected_move(sample: dict[str, Any]) -> Any:
@@ -149,37 +213,52 @@ def _sample_expected_move(sample: dict[str, Any]) -> Any:
     return None
 
 
+def _label_status(sample: dict[str, Any], horizon: int) -> str:
+    labels = sample.get("labels") or {}
+    label = labels.get(str(int(horizon))) if isinstance(labels, dict) else None
+    if not isinstance(label, dict):
+        return "pending"
+    net = _finite_float(label.get("net_return"))
+    move = _finite_float(label.get("absolute_mid_move"))
+    if net is not None and move is not None:
+        return "labeled"
+    if str(label.get("status") or "").lower() == "missed":
+        return "missed"
+    return "invalid"
+
+
 def summarize_samples(
     samples: Iterable[dict[str, Any]],
     horizons: Iterable[int],
     *,
     split_fraction: float = 0.60,
 ) -> dict[str, Any]:
-    """Build current-strategy forward-edge reports for each horizon.
+    """Build descriptive forward-edge reports for the current strategy.
 
-    Samples are grouped as all observed candidate evaluations and BUY decisions.
-    The chronological holdout section is not a trained model/OOS claim; it keeps
-    the later observations separate so future calibration work can avoid using a
-    single pooled statistic as if it were prospective evidence.
+    BUY and all-candidate observations are reported separately. For each
+    horizon, train/holdout statistics use a purge gap equal to that horizon so
+    forward labels from the training set cannot overlap the beginning of the
+    holdout period. No thresholds are fitted or optimized here.
     """
-    source = list(samples)
-    train, holdout = chronological_split(source, split_fraction)
+    source = _ordered(list(samples))
+    raw_train, raw_holdout = chronological_split(source, split_fraction)
 
-    def labeled(rows: list[dict[str, Any]], horizon: int, only_buy: bool) -> list[dict[str, Any]]:
+    def labeled(
+        rows: list[dict[str, Any]], horizon: int, only_buy: bool
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         key = str(int(horizon))
         for sample in rows:
-            if only_buy and str(sample.get("signal") or "").upper() != "BUY":
+            if (
+                only_buy
+                and str(sample.get("signal") or "").upper() != "BUY"
+            ):
                 continue
             labels = sample.get("labels") or {}
             label = labels.get(key) if isinstance(labels, dict) else None
             if not isinstance(label, dict):
                 continue
             merged = dict(label)
-            # Several HOLD branches intentionally return a compact decision and
-            # do not repeat expected_move_pct. The feature snapshot is the
-            # canonical value for ExpectedMove calibration across both BUY and
-            # rejected candidate observations.
             merged["expected_move_pct"] = _sample_expected_move(sample)
             result.append(merged)
         return result
@@ -187,19 +266,59 @@ def summarize_samples(
     report: dict[str, Any] = {
         "sample_count": len(source),
         "buy_sample_count": sum(
-            str(sample.get("signal") or "").upper() == "BUY" for sample in source
+            str(sample.get("signal") or "").upper() == "BUY"
+            for sample in source
         ),
         "chronological_split_fraction": split_fraction,
-        "train_sample_count": len(train),
-        "holdout_sample_count": len(holdout),
+        "raw_train_sample_count": len(raw_train),
+        "raw_holdout_sample_count": len(raw_holdout),
         "horizons": {},
     }
-    for horizon in sorted({int(value) for value in horizons if int(value) > 0}):
+    for horizon in sorted(
+        {int(value) for value in horizons if int(value) > 0}
+    ):
+        train, holdout = purged_chronological_split(
+            source,
+            horizon_seconds=horizon,
+            fraction=split_fraction,
+        )
+        statuses = [_label_status(sample, horizon) for sample in source]
+        buy_source = [
+            sample
+            for sample in source
+            if str(sample.get("signal") or "").upper() == "BUY"
+        ]
+        buy_statuses = [
+            _label_status(sample, horizon) for sample in buy_source
+        ]
+        labeled_count = statuses.count("labeled")
+        buy_labeled_count = buy_statuses.count("labeled")
         report["horizons"][str(horizon)] = {
+            "sample_count": len(source),
+            "labeled_sample_count": labeled_count,
+            "missed_label_count": statuses.count("missed"),
+            "pending_label_count": statuses.count("pending"),
+            "invalid_label_count": statuses.count("invalid"),
+            "label_completion_rate": (
+                labeled_count / len(source) if source else None
+            ),
+            "buy_sample_count": len(buy_source),
+            "buy_labeled_sample_count": buy_labeled_count,
+            "buy_missed_label_count": buy_statuses.count("missed"),
+            "buy_label_completion_rate": (
+                buy_labeled_count / len(buy_source) if buy_source else None
+            ),
+            "purged_train_sample_count": len(train),
+            "purged_from_train_count": max(0, len(raw_train) - len(train)),
+            "holdout_sample_count": len(holdout),
             "all": summarize_labeled_rows(labeled(source, horizon, False)),
             "buy": summarize_labeled_rows(labeled(source, horizon, True)),
-            "train_buy": summarize_labeled_rows(labeled(train, horizon, True)),
-            "holdout_buy": summarize_labeled_rows(labeled(holdout, horizon, True)),
+            "train_buy": summarize_labeled_rows(
+                labeled(train, horizon, True)
+            ),
+            "holdout_buy": summarize_labeled_rows(
+                labeled(holdout, horizon, True)
+            ),
         }
     return report
 
@@ -208,4 +327,6 @@ def reason_counts(samples: Iterable[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = defaultdict(int)
     for sample in samples:
         counts[str(sample.get("reason") or "-")] += 1
-    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+    return dict(
+        sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    )
