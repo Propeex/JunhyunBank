@@ -220,3 +220,43 @@ def test_empty_deep_set_stops_stream(monkeypatch, tmp_path):
 
     assert first is not None and first.stopped == 1
     assert engine._deep_stream is None
+
+
+def test_start_again_recreates_streams_with_unchanged_markets(monkeypatch,tmp_path):
+    import junhyunbank.engine as module
+    client=_MarketClient([{'market':'KRW-BTC','market_event':_normal_event()}])
+    engine=_engine(tmp_path,client)
+    monkeypatch.setattr(module,'MarketStream',_FakeStream)
+    engine._refresh_markets()
+    old=engine._global_streams[0]
+    old.stop()
+    engine._global_streams.clear()
+    engine._deep_markets=['KRW-BTC']
+    engine._live_portfolio=lambda: (10000,10000,10000,[])
+    class Thread:
+        def __init__(self,**kwargs): pass
+        def is_alive(self): return False
+        def start(self): pass
+    monkeypatch.setattr(module.threading,'Thread',Thread)
+    engine.start()
+    engine._refresh_markets()
+    assert engine._global_streams[0] is not old
+    assert engine._global_streams[0].started == 1
+    assert engine._deep_markets == []
+
+
+def test_market_newly_flagged_cannot_remain_entry_candidate(tmp_path):
+    engine=_engine(tmp_path)
+    engine._allowed_markets=['KRW-BTC']
+    engine._deep_markets=['KRW-RISK']
+    assert 'KRW-RISK' not in engine._select_deep_markets([('KRW-RISK',99),('KRW-BTC',80)])
+
+
+def test_warning_managed_market_keeps_trade_subscription(monkeypatch,tmp_path):
+    import junhyunbank.engine as module
+    engine=_engine(tmp_path)
+    monkeypatch.setattr(module,'MarketStream',_FakeStream)
+    engine.storage.mark_managed_position('KRW-RISK',managed_quantity=1)
+    engine._allowed_markets=['KRW-BTC']
+    engine._restart_global_streams()
+    assert engine._global_streams[0].markets==['KRW-BTC','KRW-RISK']

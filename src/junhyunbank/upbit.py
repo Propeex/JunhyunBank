@@ -14,7 +14,9 @@ from .models import Candle
 
 
 class UpbitAPIError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def build_query_string(values: dict[str, Any] | None) -> str:
@@ -45,7 +47,7 @@ class UpbitClient:
         self.http = httpx.Client(
             base_url=self.BASE_URL,
             timeout=timeout,
-            headers={"Accept": "application/json", "User-Agent": "JunhyunBank/3.0"},
+            headers={"Accept": "application/json", "User-Agent": "JunhyunBank/4.0"},
         )
         self._private_lock = threading.Lock()
         self._last_private_request = 0.0
@@ -78,11 +80,11 @@ class UpbitClient:
                 err = payload["error"]
                 raise UpbitAPIError(
                     f"{response.status_code} {err.get('name', 'upbit_error')}: "
-                    f"{err.get('message', '요청에 실패했습니다.')}"
+                    f"{err.get('message', '요청에 실패했습니다.')}", response.status_code
                 )
         except ValueError:
             pass
-        raise UpbitAPIError(f"업비트 API 오류: HTTP {response.status_code}")
+        raise UpbitAPIError(f"업비트 API 오류: HTTP {response.status_code}", response.status_code)
 
     def _private_rate_guard(self) -> None:
         minimum_interval = 1.0 / 11.0
@@ -104,7 +106,7 @@ class UpbitClient:
         lock = self._private_lock if private else _NullLock()
 
         with lock:
-            for attempt in range(3):
+            for attempt in range(3 if method.upper() == 'GET' else 1):
                 headers: dict[str, str] = {}
                 if private:
                     self._private_rate_guard()
@@ -120,11 +122,13 @@ class UpbitClient:
                     headers=headers,
                 )
                 if response.status_code == 429:
+                    if method.upper() != 'GET':
+                        self._raise_for_error(response)
                     time.sleep(1.05 * (attempt + 1))
                     continue
                 if response.status_code == 418:
                     raise UpbitAPIError(
-                        "업비트 요청 제한으로 IP가 일시 차단되었습니다. 잠시 후 다시 시도하세요."
+                        "업비트 요청 제한으로 IP가 일시 차단되었습니다. 잠시 후 다시 시도하세요.", 418
                     )
                 self._raise_for_error(response)
                 return response.json()
@@ -222,25 +226,25 @@ class UpbitClient:
     def test_credentials(self) -> None:
         self.get_accounts()
 
-    def place_best_ioc_buy(self, market: str, krw_amount: float) -> dict[str, Any]:
+    def place_best_ioc_buy(self, market: str, krw_amount: float, *, identifier: str | None = None) -> dict[str, Any]:
         body = {
             "market": market,
             "side": "bid",
             "price": f"{krw_amount:.0f}",
             "ord_type": "best",
             "time_in_force": "ioc",
-            "identifier": f"junhyunbank-v2-{uuid.uuid4()}",
+            "identifier": identifier or f"junhyunbank-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
 
-    def place_best_ioc_sell(self, market: str, volume: float) -> dict[str, Any]:
+    def place_best_ioc_sell(self, market: str, volume: float, *, identifier: str | None = None) -> dict[str, Any]:
         body = {
             "market": market,
             "side": "ask",
             "volume": format(volume, ".16g"),
             "ord_type": "best",
             "time_in_force": "ioc",
-            "identifier": f"junhyunbank-v2-{uuid.uuid4()}",
+            "identifier": identifier or f"junhyunbank-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
 
@@ -254,13 +258,13 @@ class UpbitClient:
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
 
-    def place_market_sell(self, market: str, volume: float) -> dict[str, Any]:
+    def place_market_sell(self, market: str, volume: float, *, identifier: str | None = None) -> dict[str, Any]:
         body = {
             "market": market,
             "side": "ask",
             "volume": format(volume, ".16g"),
             "ord_type": "market",
-            "identifier": f"junhyunbank-v2-{uuid.uuid4()}",
+            "identifier": identifier or f"junhyunbank-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
 

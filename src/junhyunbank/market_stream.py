@@ -193,12 +193,15 @@ class MarketStream:
                 if not self._send_subscription():
                     raise RuntimeError("WebSocket 구독 요청 전송 실패")
                 self._last_error = ""
+                connected_at = time.monotonic()
                 self._emit_status("connected")
                 backoff = 1.0
                 while not self._stop.is_set():
                     try:
                         payload = ws.recv()
                     except websocket.WebSocketTimeoutException:
+                        if time.monotonic() - max(connected_at, self._last_message) >= 30.0:
+                            raise RuntimeError('30초 이상 시세 수신 없음 · 연결 복구')
                         ws.ping()
                         continue
                     if payload in (None, "", b""):

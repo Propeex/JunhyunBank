@@ -130,6 +130,7 @@ class TradingEngine(BaseTradingEngine):
         try:
             rows = self.client.get_markets()
         except Exception:
+            self._market_discovery_ready = False
             self._market_discovery_retry_at = now + 10.0
             raise
 
@@ -161,6 +162,7 @@ class TradingEngine(BaseTradingEngine):
         allowed = sorted(dict.fromkeys(allowed))
 
         if not raw_krw:
+            self._market_discovery_ready = False
             self._market_discovery_retry_at = now + 10.0
             sample_codes = [
                 str(row.get("market") or "")
@@ -173,6 +175,7 @@ class TradingEngine(BaseTradingEngine):
             )
 
         if not allowed:
+            self._market_discovery_ready = False
             self._market_discovery_retry_at = now + 10.0
             raise RuntimeError(
                 "KRW 마켓은 수신했지만 안전하게 해석 가능한 종목이 0개입니다. "
@@ -182,6 +185,7 @@ class TradingEngine(BaseTradingEngine):
             )
 
         self._market_discovery_retry_at = 0.0
+        self._market_discovery_ready = True
         if allowed == self._allowed_markets:
             return
 
@@ -201,19 +205,7 @@ class TradingEngine(BaseTradingEngine):
         )
 
     def _reset_orderbook_state(self, market: str) -> None:
-        # A market can leave the deep set and return later. Mixing a new book
-        # snapshot with old delta history would distort Book Pressure, so start
-        # its orderbook-only state fresh on re-entry. Trade/momentum history is
-        # intentionally preserved.
-        books = getattr(self.strategy, "_books", None)
-        if isinstance(books, dict):
-            books.pop(market, None)
-        history = getattr(self.strategy, "_book_history", None)
-        if history is not None:
-            try:
-                history.pop(market, None)
-            except (AttributeError, KeyError):
-                pass
+        self.strategy.reset_orderbook(market)
 
     def _restart_deep_stream(self, markets: list[str]) -> None:
         markets = sorted(dict.fromkeys(markets))
