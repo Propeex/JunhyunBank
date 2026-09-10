@@ -13,17 +13,31 @@ from .runtime_engine import TradingEngine
 from .security import KeyStore
 from .ui import ApiKeyDialog, MainWindow
 from .upbit import UpbitClient
+from .updater import verify_post_update_install
 
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--resume-trading", action="store_true")
+    parser.add_argument("--post-update-verify")
     args, _ = parser.parse_known_args(sys.argv[1:])
     return args
 
 
 def main() -> int:
     args = _args()
+
+    # The detached updater launches the newly installed binary once in this
+    # non-trading verification mode before normal startup. No API request or
+    # order can happen here. A token-bound marker is written only after current
+    # Storage migrations and SQLite integrity checks succeed.
+    if args.post_update_verify:
+        try:
+            verify_post_update_install(str(args.post_update_verify))
+            return 0
+        except Exception:
+            return 3
+
     app = QApplication(sys.argv)
     app.setApplicationName("JunhyunBank")
 
