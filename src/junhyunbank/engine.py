@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -32,12 +33,15 @@ class TradingEngine:
         self._deep_stream: MarketStream | None = None
         self._allowed_markets: list[str] = []
         self._deep_markets: list[str] = []
+        self._deep_entered_at: dict[str, float] = {}
         self._latest_prices: dict[str, float] = {}
         self._last_price_ui_emit: dict[str, float] = {}
         self._order_lock = threading.Lock()
         self._fee_cache: dict[str, tuple[float, float, float, float, float]] = {}
         self._session_start_equity: float | None = None
         self._update_shutdown = False
+        self._run_started_at = 0.0
+        self._last_no_candidate_warning = 0.0
 
     @property
     def running(self) -> bool:
@@ -63,6 +67,8 @@ class TradingEngine:
         self.risk.reset_session()
         self._hard_stop.clear()
         self._update_shutdown = False
+        self._run_started_at = time.monotonic()
+        self._last_no_candidate_warning = 0.0
         equity, _, _, _ = self._live_portfolio()
         self._session_start_equity = equity
         self._state = EngineState.RUNNING
@@ -136,26 +142,91 @@ class TradingEngine:
         self._restart_global_streams()
         self._emit("market_universe", f"KRW 실시간 감시 종목 {len(allowed)}개", count=len(allowed))
 
+    def _stream_status(self, payload: dict[str, Any]) -> None:
+        self.events.put({"type": "stream_status", **payload})
+
     def _restart_global_streams(self) -> None:
         for stream in self._global_streams:
             stream.stop()
         self._global_streams.clear()
         for index, markets in enumerate(self._chunks(self._allowed_markets, 100)):
-            stream = MarketStream(markets, on_trade=self._on_trade, on_error=lambda message, idx=index: self._emit("warning", f"시장 스트림 {idx + 1}: {message}"), name=f"upbit-trades-{index + 1}")
+            stream = MarketStream(
+                markets,
+                on_trade=self._on_trade,
+                on_error=lambda message, idx=index: self._emit("warning", f"시장 스트림 {idx + 1}: {message}"),
+                on_status=self._stream_status,
+                name=f"upbit-trades-{index + 1}",
+            )
             stream.start()
             self._global_streams.append(stream)
 
+    def _select_deep_markets(self, ranked: list[tuple[str, float]]) -> list[str]:
+        now = time.monotonic()
+        managed = self.storage.managed_markets()
+        desired = [market for market, _ in ranked[: self.config.strategy.deep_candidate_count]]
+        scores = dict(ranked)
+        selected: list[str] = sorted(managed)
+
+        for market in self._deep_markets:
+            if market in managed:
+                continue
+            age = now - self._deep_entered_at.get(market, now)
+            if market in desired or age < self.config.strategy.deep_min_residency_seconds:
+                selected.append(market)
+
+        def nonmanaged_count() -> int:
+            return sum(1 for market in selected if market not in managed)
+
+        for market in desired:
+            if market in selected:
+                continue
+            if nonmanaged_count() < self.config.strategy.deep_candidate_count:
+                selected.append(market)
+                continue
+            replaceable = [
+                current
+                for current in selected
+                if current not in managed
+                and current not in desired
+                and now - self._deep_entered_at.get(current, now) >= self.config.strategy.deep_min_residency_seconds
+            ]
+            if not replaceable:
+                continue
+            weakest = min(replaceable, key=lambda current: scores.get(current, 0.0))
+            if scores.get(market, 0.0) >= scores.get(weakest, 0.0) + self.config.strategy.deep_switch_margin:
+                selected.remove(weakest)
+                selected.append(market)
+
+        return sorted(dict.fromkeys(selected))
+
     def _restart_deep_stream(self, markets: list[str]) -> None:
-        markets = list(dict.fromkeys(markets))
+        markets = sorted(dict.fromkeys(markets))
         if markets == self._deep_markets:
             return
+        previous = set(self._deep_markets)
         if self._deep_stream:
             self._deep_stream.stop()
             self._deep_stream = None
         self._deep_markets = markets
+        now = time.monotonic()
+        self._deep_entered_at = {
+            market: self._deep_entered_at.get(market, now)
+            for market in markets
+        }
         if markets:
-            self._deep_stream = MarketStream(markets, on_orderbook=self._on_orderbook, on_error=lambda message: self._emit("warning", f"호가 스트림: {message}"), orderbook_depth=max(5, self.config.strategy.orderbook_depth), name="upbit-orderbook-deep")
+            self._deep_stream = MarketStream(
+                markets,
+                on_orderbook=self._on_orderbook,
+                on_error=lambda message: self._emit("warning", f"호가 스트림: {message}"),
+                on_status=self._stream_status,
+                orderbook_depth=max(5, self.config.strategy.orderbook_depth),
+                name="upbit-orderbook-deep",
+            )
             self._deep_stream.start()
+        added = sorted(set(markets) - previous)
+        removed = sorted(previous - set(markets))
+        if added or removed:
+            self.events.put({"type": "deep_set", "added": added, "removed": removed, "count": len(markets)})
 
     def _on_trade(self, event: dict[str, Any]) -> None:
         self.strategy.on_trade(event)
@@ -172,8 +243,43 @@ class TradingEngine:
     def _on_orderbook(self, event: dict[str, Any]) -> None:
         self.strategy.on_orderbook(event)
 
+    @staticmethod
+    def _finite_age(value: float) -> float | None:
+        return value if math.isfinite(value) else None
+
+    def _publish_runtime_health(self, ranked: list[tuple[str, float]]) -> None:
+        tracked = sum(1 for market in self._allowed_markets if self.strategy.latest_price(market))
+        warmed = sum(
+            1
+            for market in self._allowed_markets
+            if self.strategy.warmup_ratio(market) >= 1.0 and self.strategy.trade_age(market) <= 30.0
+        )
+        global_total = len(self._global_streams)
+        global_connected = sum(1 for stream in self._global_streams if stream.connected)
+        global_ages = [stream.age_seconds for stream in self._global_streams]
+        trade_age = max(global_ages) if global_ages else float("inf")
+        deep_connected = bool(self._deep_stream and self._deep_stream.connected)
+        deep_age = self._deep_stream.age_seconds if self._deep_stream else float("inf")
+        self.events.put(
+            {
+                "type": "runtime_health",
+                "global_connected": global_connected,
+                "global_total": global_total,
+                "trade_age": self._finite_age(trade_age),
+                "deep_connected": deep_connected,
+                "deep_age": self._finite_age(deep_age),
+                "deep_markets": len(self._deep_markets),
+                "tracked_markets": tracked,
+                "warmed_markets": warmed,
+                "allowed_markets": len(self._allowed_markets),
+                "candidate_count": len(ranked),
+                "elapsed": max(0.0, time.monotonic() - self._run_started_at),
+            }
+        )
+
     def _run(self) -> None:
-        next_market_refresh = next_candidate_refresh = next_evaluation = next_portfolio = 0.0
+        next_market_refresh = next_candidate_refresh = next_evaluation = next_portfolio = next_runtime_health = 0.0
+        last_ranked: list[tuple[str, float]] = []
         try:
             while not self._hard_stop.is_set():
                 now = time.monotonic()
@@ -184,14 +290,28 @@ class TradingEngine:
                         self.risk.report_api_failure(); self._emit("warning", f"시장 목록 갱신 실패: {exc}")
                     next_market_refresh = now + self.config.strategy.market_refresh_seconds
                 if now >= next_candidate_refresh:
-                    ranked = self.strategy.rank_markets(self._allowed_markets, self.config.strategy.deep_candidate_count)
-                    candidates = [market for market, _ in ranked]
-                    for market in sorted(self.storage.managed_markets()):
-                        if market not in candidates:
-                            candidates.append(market)
-                    self._restart_deep_stream(candidates)
-                    self.events.put({"type": "candidates", "markets": [m for m, _ in ranked[:12]], "scores": {m: s for m, s in ranked[:12]}})
+                    last_ranked = self.strategy.rank_markets(self._allowed_markets, self.config.strategy.scanner_candidate_count)
+                    deep = self._select_deep_markets(last_ranked)
+                    self._restart_deep_stream(deep)
+                    top = last_ranked[:12]
+                    self.events.put(
+                        {
+                            "type": "candidates",
+                            "markets": [market for market, _ in top],
+                            "scores": {market: score for market, score in top},
+                            "prices": {market: self._latest_prices.get(market) for market, _ in top},
+                            "tracked": len(self._latest_prices),
+                        }
+                    )
+                    elapsed = now - self._run_started_at
+                    if not last_ranked and elapsed >= self.config.strategy.no_candidate_warning_seconds:
+                        if now - self._last_no_candidate_warning >= 60.0:
+                            self._last_no_candidate_warning = now
+                            self._emit("warning", "5분 이상 후보가 없습니다. 정상 대기보다 실시간 체결 수신/워밍업 상태를 먼저 확인하세요.")
                     next_candidate_refresh = now + self.config.strategy.candidate_refresh_seconds
+                if now >= next_runtime_health:
+                    self._publish_runtime_health(last_ranked)
+                    next_runtime_health = now + self.config.strategy.runtime_health_seconds
                 if now >= next_evaluation:
                     self._evaluate_cycle(); next_evaluation = now + self.config.strategy.evaluation_seconds
                 if now >= next_portfolio:
