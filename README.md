@@ -1,4 +1,10 @@
-# JunhyunBank V4.0.0
+# JunhyunBank V4.0.1
+
+## V4.0.1 — 업데이트 사전검증과 원자 롤백
+
+V4.0.1은 거래 전략을 바꾸지 않는 배포 안정화 패치입니다. 새 EXE를 교체한 뒤 곧바로 LIVE 자동매매를 재개하지 않고, 먼저 비거래 검증 모드로 현재 SQLite DB의 스키마/무결성을 확인합니다. 검증 실패 시 이전 EXE와 업데이트 직전 DB snapshot을 함께 복원합니다.
+
+상세 설계와 전환 주의점: **[V4.0.1 업데이트 복구](docs/V4_0_1_UPDATE_RECOVERY.md)**.
 
 ## V4 — 매수 진단과 주문 복구
 
@@ -27,6 +33,8 @@
 
 전체 문서 색인: [`docs/README.md`](docs/README.md)
 
+- [`docs/V4_AUDIT.md`](docs/V4_AUDIT.md) — V4 런타임·주문·매수 경로 감사와 남은 과제
+- [`docs/V4_0_1_UPDATE_RECOVERY.md`](docs/V4_0_1_UPDATE_RECOVERY.md) — 업데이트 health handshake와 EXE+DB rollback
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 런타임/모듈/주문/업데이트 구조
 - [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md) — 전략 의도, 수식, 실제 구현과 미구현 설계
 - [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 리스크, P0/P1/P2 로드맵
@@ -75,18 +83,18 @@ V2에서 도입한 단기 수급/호가 기반 전략 구조를 V3에서도 유�
 
 ## 업데이트
 
-V2부터 상단 `업데이트` 버튼을 지원합니다.
+V2부터 상단 `업데이트` 버튼을 지원합니다. V4.0.1부터 새 updater가 생성하는 적용 스크립트는 다음 순서를 사용합니다.
 
-1. GitHub 최신 Release를 확인합니다.
-2. 새 `JunhyunBank.exe`를 다운로드합니다.
-3. GitHub Release가 제공하는 SHA-256 digest와 다운로드 파일을 비교합니다.
-4. 검증에 성공하면 현재 실행파일을 교체합니다.
-5. 프로그램을 자동 재시작합니다.
-6. 업데이트 직전 자동매매가 실행 중이었다면 재시작 후 LIVE 감시를 자동 재개합니다.
+1. GitHub 최신 Release의 `JunhyunBank.exe`를 다운로드하고 Release SHA-256 digest를 검증합니다.
+2. 현재 프로그램이 완전히 종료된 뒤 기존 EXE와 SQLite DB/WAL/SHM을 snapshot으로 보존합니다.
+3. 새 EXE로 교체한 뒤 `--post-update-verify` 비거래 모드로 실행합니다.
+4. 새 버전이 DB migration, `PRAGMA quick_check`, 필수 테이블 확인을 통과하고 token/version health marker를 남겼는지 검증합니다.
+5. 실패하면 이전 EXE와 업데이트 직전 DB snapshot을 함께 복원하고, 이전 버전을 **자동매매 자동재개 없이** 실행합니다.
+6. 성공한 경우에만 backup을 제거하고 새 버전을 정상 실행합니다. 업데이트 직전 자동매매가 실행 중이었다면 이 단계 이후 LIVE 감시를 자동 재개합니다.
 
-API Key는 실행파일 내부가 아니라 운영체제 keyring에 저장되므로 업데이트 후 다시 입력할 필요가 없습니다. 거래/포지션 상태는 `~/.junhyunbank/junhyunbank.db`에 유지됩니다.
+API Key는 실행파일 내부가 아니라 운영체제 keyring에 저장되므로 업데이트 후 다시 입력할 필요가 없습니다. 거래/포지션/미확정 주문 상태는 `~/.junhyunbank/junhyunbank.db`에 유지됩니다.
 
-V2 사용자는 프로그램의 `업데이트` 버튼으로 V3를 받을 수 있습니다.
+주의: V4.0.0 → V4.0.1 최초 업데이트는 적용 스크립트를 V4.0.0 코드가 생성하므로 새 transactional rollback은 **V4.0.1 설치 이후 다음 업데이트부터** 완전히 적용됩니다.
 
 ## UI
 
@@ -102,9 +110,9 @@ V2 사용자는 프로그램의 `업데이트` 버튼으로 V3를 받을 수 있
 
 전체 KRW 마켓의 `trade` WebSocket을 여러 persistent 연결로 분할해 실시간 수집합니다. 1초 단위 프레임으로 거래대금과 BID/ASK 체결을 집계하고, 상대적으로 뜨거워진 후보에 대해서만 `orderbook`을 구독해 5개 호가쌍의 OBI·Microprice·호가 변화 및 실제 체결 가능 금액을 분석합니다.
 
-V3 런타임은 `runtime_engine.TradingEngine`이 V2의 핵심 `engine.TradingEngine`을 상속합니다. 주문·리스크·DRAINING·관리 포지션 로직은 기존 엔진을 그대로 사용하고, deep orderbook 구독 lifecycle만 안정화 계층에서 처리합니다.
+V4 런타임은 `runtime_engine.TradingEngine`이 핵심 `engine.TradingEngine`을 상속합니다. V4에서는 이 구조 위에 주문 의도 영속화와 재시작/체결 복구가 추가돼 있습니다.
 
-주문은 일반 진입/청산에 Upbit `best + IOC`를 사용합니다. Emergency Stop 청산에서 IOC가 체결되지 않을 경우 시장가 매도를 보조 수단으로 사용할 수 있습니다. 거래소 API Rate Limit은 전략상의 거래횟수 제한과 별개로 항상 준수합니다.
+주문은 일반 진입/청산에 Upbit `best + IOC`를 사용합니다. Emergency Stop 청산에서 IOC가 명시적으로 종료되고 0체결임이 확인된 경우에만 시장가 매도를 보조 수단으로 사용할 수 있습니다. 거래소 API Rate Limit은 전략상의 거래횟수 제한과 별개로 항상 준수합니다.
 
 ## 보안
 
@@ -122,9 +130,9 @@ python scripts/smoke_upbit_public_ws.py --timeout 20 --attempts 3
 python launcher.py
 ```
 
-Public WebSocket smoke test는 `KRW-BTC`의 체결과 호가를 실제 Upbit Public WebSocket에서 받는지만 검증하며 **API Key와 주문 API를 사용하지 않습니다.**
+Public WebSocket smoke test는 실제 Upbit 시장 탐색 후 선택한 KRW 페어의 체결과 호가를 받는지를 검증하며 **API Key와 주문 API를 사용하지 않습니다.**
 
-`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.0` 등)를 생성합니다.
+`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public REST/WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.1` 등)를 생성합니다.
 
 ## 전략 검증에 대한 원칙
 
