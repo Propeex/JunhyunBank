@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from junhyunbank.config import AppConfig, StrategyConfig
 from junhyunbank.runtime_engine import TradingEngine
 from junhyunbank.storage import Storage
@@ -8,6 +10,14 @@ from junhyunbank.storage import Storage
 class _DummyClient:
     access_key = "a"
     secret_key = "b"
+
+
+class _MarketClient(_DummyClient):
+    def __init__(self, rows):
+        self.rows = rows
+
+    def get_markets(self):
+        return self.rows
 
 
 class _FakeStream:
@@ -35,13 +45,114 @@ class _FakeStream:
         return True
 
 
-def _engine(tmp_path: Path) -> TradingEngine:
+def _engine(tmp_path: Path, client=None) -> TradingEngine:
     config = AppConfig(strategy=StrategyConfig(deep_candidate_count=2))
     return TradingEngine(
-        _DummyClient(),
+        client or _DummyClient(),
         config,
         storage=Storage(tmp_path / "runtime.db"),
     )
+
+
+def _normal_event(**overrides):
+    event = {
+        "warning": False,
+        "caution": {
+            "PRICE_FLUCTUATIONS": False,
+            "TRADING_VOLUME_SOARING": False,
+            "DEPOSIT_AMOUNT_SOARING": False,
+            "GLOBAL_PRICE_DIFFERENCES": False,
+            "CONCENTRATION_OF_SMALL_ACCOUNTS": False,
+        },
+    }
+    event.update(overrides)
+    return event
+
+
+def test_alert_parser_does_not_treat_string_false_as_true():
+    row = {
+        "market": "KRW-BTC",
+        "market_event": {
+            "warning": "false",
+            "caution": {
+                "PRICE_FLUCTUATIONS": "false",
+                "TRADING_VOLUME_SOARING": "0",
+            },
+        },
+    }
+    flagged, understood = TradingEngine._market_alert_status(row)
+    assert understood is True
+    assert flagged is False
+    assert TradingEngine._is_warning_market(row) is False
+
+
+def test_alert_parser_still_excludes_explicit_caution():
+    row = {
+        "market": "KRW-X",
+        "market_event": _normal_event(
+            caution={"TRADING_VOLUME_SOARING": True}
+        ),
+    }
+    flagged, understood = TradingEngine._market_alert_status(row)
+    assert understood is True
+    assert flagged is True
+    assert TradingEngine._is_warning_market(row) is True
+
+
+def test_unknown_alert_shape_fails_closed():
+    row = {
+        "market": "KRW-X",
+        "market_event": {
+            "warning": {"state": "false"},
+            "caution": {},
+        },
+    }
+    flagged, understood = TradingEngine._market_alert_status(row)
+    assert flagged is False
+    assert understood is False
+    assert TradingEngine._is_warning_market(row) is True
+
+
+def test_refresh_markets_builds_nonzero_krw_streams(monkeypatch, tmp_path):
+    import junhyunbank.runtime_engine as module
+
+    rows = [
+        {"market": "KRW-BTC", "market_event": _normal_event()},
+        {"market": "KRW-ETH", "market_event": _normal_event()},
+        {
+            "market": "KRW-RISK",
+            "market_event": _normal_event(
+                caution={"PRICE_FLUCTUATIONS": True}
+            ),
+        },
+        {"market": "BTC-ETH", "market_event": _normal_event()},
+    ]
+    _FakeStream.instances.clear()
+    monkeypatch.setattr(module, "MarketStream", _FakeStream)
+    engine = _engine(tmp_path, _MarketClient(rows))
+
+    engine._refresh_markets()
+
+    assert engine._allowed_markets == ["KRW-BTC", "KRW-ETH"]
+    assert len(engine._global_streams) == 1
+    assert engine._global_streams[0].started == 1
+    assert engine._global_streams[0].markets == ["KRW-BTC", "KRW-ETH"]
+    universe = [e for e in engine.drain_events() if e.get("type") == "market_universe"]
+    assert universe and universe[-1]["count"] == 2
+    assert universe[-1]["flagged"] == 1
+
+
+def test_refresh_markets_never_silently_accepts_zero_safe_markets(tmp_path):
+    rows = [
+        {
+            "market": "KRW-BTC",
+            "market_event": {"warning": {"unexpected": False}, "caution": {}},
+        }
+    ]
+    engine = _engine(tmp_path, _MarketClient(rows))
+
+    with pytest.raises(RuntimeError, match="안전하게 해석 가능한 종목이 0개"):
+        engine._refresh_markets()
 
 
 def test_deep_candidate_change_reuses_existing_stream(monkeypatch, tmp_path):
