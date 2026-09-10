@@ -3,8 +3,10 @@ from __future__ import annotations
 import math
 import statistics
 import time
+import threading
+from functools import wraps
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .config import StrategyConfig
@@ -34,6 +36,14 @@ class BookSnapshot:
     imbalance: float
     micro_bias: float
     spread_pct: float
+
+
+def synchronized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -79,6 +89,7 @@ class MicroFlowStrategy:
     """상대적 수급/거래활동/호가/모멘텀을 결합하는 실시간 단타 전략."""
 
     def __init__(self, config: StrategyConfig) -> None:
+        self._lock = threading.RLock()
         self.config = config
         maxlen = max(config.baseline_seconds + 120, 600)
         self._frames: dict[str, deque[SecondFrame]] = defaultdict(
@@ -93,14 +104,15 @@ class MicroFlowStrategy:
         self._last_trade_received: dict[str, float] = {}
         self._blocked_after_exit: set[str] = set()
 
+    @synchronized
     def on_trade(self, event: dict[str, Any]) -> None:
         market = str(event.get("code") or "")
         price = float(event.get("trade_price") or 0.0)
         volume = float(event.get("trade_volume") or 0.0)
-        if not market or price <= 0 or volume <= 0:
+        if not market or not math.isfinite(price) or not math.isfinite(volume) or price <= 0 or volume <= 0:
             return
 
-        timestamp_ms = int(event.get("timestamp") or time.time() * 1000)
+        timestamp_ms = int(event.get("trade_timestamp") or event.get("timestamp") or time.time() * 1000)
         second = timestamp_ms // 1000
         side = str(event.get("ask_bid") or "").upper()
         value = price * volume
@@ -149,6 +161,7 @@ class MicroFlowStrategy:
         elif side == "ASK":
             frame.ask_value += value
 
+    @synchronized
     def on_orderbook(self, event: dict[str, Any]) -> None:
         market = str(event.get("code") or "")
         units = event.get("orderbook_units") or []
@@ -160,7 +173,9 @@ class MicroFlowStrategy:
         ask_prices = [float(row.get("ask_price") or 0.0) for row in selected]
         bid_sizes = [float(row.get("bid_size") or 0.0) for row in selected]
         ask_sizes = [float(row.get("ask_size") or 0.0) for row in selected]
-        if bid_prices[0] <= 0 or ask_prices[0] <= 0:
+        if any(not math.isfinite(x) or x <= 0 for x in bid_prices + ask_prices) or any(not math.isfinite(x) or x < 0 for x in bid_sizes + ask_sizes):
+            return
+        if bid_prices[0] > ask_prices[0]:
             return
         weights = [1.0 / math.sqrt(idx + 1) for idx in range(depth)]
         bid_depth = sum(
@@ -226,11 +241,12 @@ class MicroFlowStrategy:
             else float("inf")
         )
 
+    @synchronized
     def _series(self, market: str) -> list[SecondFrame]:
         items = list(self._frames.get(market, ()))
         current = self._current.get(market)
         if current is not None:
-            items.append(current)
+            items.append(replace(current))
         return items
 
     def warmup_ratio(self, market: str) -> float:
@@ -252,6 +268,7 @@ class MicroFlowStrategy:
         total = frame.bid_value + frame.ask_value
         return (frame.bid_value - frame.ask_value) / total if total else 0.0
 
+    @synchronized
     def _feature_set(self, market: str) -> dict[str, float] | None:
         frames = self._series(market)
         if len(frames) < self.config.min_warmup_seconds:
@@ -272,9 +289,11 @@ class MicroFlowStrategy:
         bid_now, ask_now = sum(bids[-gw:]), sum(asks[-gw:])
         flow_total = bid_now + ask_now
         aggression = (bid_now - ask_now) / flow_total if flow_total else 0.0
-        aggression_history = [
-            self._aggression(f) for f in frames[:-1] if f.trade_value > 0
-        ]
+        # Compare five-second flow with five-second history, not single trades
+        # or one-second extremes (which systematically suppress the percentile).
+        historical_bids = _rolling_sums(bids[:-1], gw)
+        historical_asks = _rolling_sums(asks[:-1], gw)
+        aggression_history = [(b-a)/(b+a) for b, a in zip(historical_bids, historical_asks) if b+a > 0]
         aggression_q = (
             _percentile_rank(aggression_history, aggression)
             if aggression > 0
@@ -425,6 +444,7 @@ class MicroFlowStrategy:
         short = self._returns(frames, 3)
         return bool(short and short[-1] > 0)
 
+    @synchronized
     def evaluate_entry(
         self,
         market: str,
@@ -440,6 +460,8 @@ class MicroFlowStrategy:
         if self.book_age(market) > 3.0:
             return StrategyDecision(Signal.HOLD, 0.0, "호가 데이터가 오래됨")
         quality = f["quality"]
+        if market in self._blocked_after_exit and quality < 0.45:
+            self._blocked_after_exit.discard(market)
         expected_move = f["expected_move"]
         spread = f["spread_pct"]
         cost = max(0.0, bid_fee) + max(0.0, ask_fee) + spread * 1.5
@@ -540,6 +562,7 @@ class MicroFlowStrategy:
             f["spread_pct"] * 3.0,
         )
 
+    @synchronized
     def evaluate_position(
         self,
         market: str,
@@ -620,6 +643,12 @@ class MicroFlowStrategy:
             hold_quality=hold,
         )
 
+    @synchronized
     def notify_exit(self, market: str) -> None:
         self._blocked_after_exit.add(market)
         self._weak_counts.pop(market, None)
+
+    @synchronized
+    def reset_orderbook(self, market: str) -> None:
+        self._books.pop(market, None)
+        self._book_history.pop(market, None)

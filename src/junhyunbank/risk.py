@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from .config import SafetyConfig
 
@@ -33,6 +34,8 @@ class RiskManager:
         self.api_failures += 1
 
     def can_open(self, *, available_cash: float, amount_krw: float, min_order_krw: float, stream_age_seconds: float) -> RiskCheck:
+        if not all(math.isfinite(x) and x >= 0 for x in (available_cash, amount_krw, min_order_krw, stream_age_seconds)):
+            return RiskCheck(False, '주문 금액/시장 데이터가 유효하지 않음')
         if self.emergency:
             return RiskCheck(False, "긴급 정지 상태")
         if self.api_failures >= self.config.max_api_failures:

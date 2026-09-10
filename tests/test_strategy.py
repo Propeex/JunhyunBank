@@ -136,3 +136,38 @@ def test_emergency_stop_distance_does_not_expand_after_entry():
     )
     assert decision.signal == Signal.SELL
     assert "Emergency Stop" in decision.reason
+
+
+def test_trade_series_is_a_snapshot_not_a_mutable_current_frame():
+    strategy=MicroFlowStrategy(StrategyConfig())
+    event=dict(code='KRW-X',trade_price=100,trade_volume=1,timestamp=1700000000000)
+    strategy.on_trade(event)
+    frames=strategy._series('KRW-X')
+    strategy.on_trade({**event,'trade_price':110})
+    assert frames[-1].close==100
+
+
+def test_reentry_reset_is_observed_even_when_cost_gate_fails():
+    strategy=MicroFlowStrategy(StrategyConfig())
+    strategy._feature_set=lambda m:_features(expected_move=.00001,quality=.2)
+    strategy._books['KRW-X']=_book()
+    strategy.notify_exit('KRW-X')
+    strategy.evaluate_entry('KRW-X',bid_fee=.0005,ask_fee=.0005,health=1,regime_factor=1)
+    assert 'KRW-X' not in strategy._blocked_after_exit
+
+
+def test_aggression_compares_equal_duration_windows(monkeypatch):
+    import junhyunbank.strategy as module
+    strategy=MicroFlowStrategy(StrategyConfig(min_warmup_seconds=40))
+    for i in range(60):
+        strategy.on_trade(dict(code='KRW-X',trade_price=100+i,trade_volume=1,ask_bid='BID' if i%2 else 'ASK',timestamp=1700000000000+i*1000))
+    captured=[]
+    original=module._percentile_rank
+    def capture(history,value):
+        captured.append(history)
+        return original(history,value)
+    monkeypatch.setattr(module,'_percentile_rank',capture)
+    strategy._feature_set('KRW-X')
+    aggression_history=captured[1]
+    assert len(aggression_history)==55
+    assert all(-.3 < value < .3 for value in aggression_history)
