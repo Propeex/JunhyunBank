@@ -15,8 +15,10 @@ class _DummyClient:
 class _MarketClient(_DummyClient):
     def __init__(self, rows):
         self.rows = rows
+        self.calls = 0
 
     def get_markets(self):
+        self.calls += 1
         return self.rows
 
 
@@ -67,6 +69,14 @@ def _normal_event(**overrides):
     }
     event.update(overrides)
     return event
+
+
+def test_nonempty_all_false_caution_dict_is_not_warning():
+    row = {"market": "KRW-BTC", "market_event": _normal_event()}
+    flagged, understood = TradingEngine._market_alert_status(row)
+    assert understood is True
+    assert flagged is False
+    assert TradingEngine._is_warning_market(row) is False
 
 
 def test_alert_parser_does_not_treat_string_false_as_true():
@@ -149,10 +159,15 @@ def test_refresh_markets_never_silently_accepts_zero_safe_markets(tmp_path):
             "market_event": {"warning": {"unexpected": False}, "caution": {}},
         }
     ]
-    engine = _engine(tmp_path, _MarketClient(rows))
+    client = _MarketClient(rows)
+    engine = _engine(tmp_path, client)
 
     with pytest.raises(RuntimeError, match="안전하게 해석 가능한 종목이 0개"):
         engine._refresh_markets()
+
+    # Immediate loop iterations must not hammer /v1/market/all again.
+    engine._refresh_markets()
+    assert client.calls == 1
 
 
 def test_deep_candidate_change_reuses_existing_stream(monkeypatch, tmp_path):
