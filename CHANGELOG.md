@@ -1,3 +1,16 @@
+# V4.0.3 — Read-only forward-edge 검증 기반
+
+- API Key와 주문 API를 전혀 사용하지 않는 `scripts/validate_public_edge.py` 추가.
+- 실제 Public trade/orderbook으로 현재 JH-MicroFlow 특징·진입판단을 워밍업하고 후보 평가 시점의 executable top-of-book을 기록.
+- 미래 label은 entry ask → future bid 기준으로 양쪽 가정 수수료와 spread를 지불한 순수익을 계산.
+- 30/60/120/300초 등 여러 forward horizon을 동시에 기록하고 BUY 표본과 전체 후보 표본을 분리 집계.
+- label 시점 quote가 허용 지연창을 벗어나면 늦은 가격으로 왜곡하지 않고 `missed`로 기록.
+- live 엔진과 동일하게 3초 stale gate를 적용하고 deep 재진입 종목의 오래된 orderbook state/quote를 폐기.
+- 시간순 holdout 앞에서 horizon만큼 training label을 purge해 forward-label overlap 데이터 누수를 차단.
+- label completion/miss, ExpectedMove calibration, 순수익률, positive rate, WebSocket 오류와 재현용 전략 설정을 JSON에 저장.
+- 이 검증은 size-free top-of-book shadow 관측으로, depth slippage·실제 주문 지연·계정 상태를 아직 모델링하지 않음.
+- 상세 설계: [V4.0.3 Forward Edge Validation](docs/V4_0_3_EDGE_VALIDATION.md).
+
 # V4.0.2 — Private 주문·자산 보조 reconciliation
 
 - authenticated Private WebSocket 한 연결에서 `myOrder` + `myAsset` 동시 구독.
