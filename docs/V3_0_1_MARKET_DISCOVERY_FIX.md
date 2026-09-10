@@ -8,23 +8,44 @@
 
 정상이라면 자동매매 시작 직후 `/v1/market/all`에서 KRW 페어 목록을 얻고, 경보 종목을 제외한 뒤 100개 단위의 Public trade WebSocket 연결을 생성한다. 이후 수초 안에 `Trade WS n/n`과 `추적 x/y`가 0이 아닌 값으로 올라가야 한다. 후보는 180초 warmup 이후에 형성될 수 있으므로 후보 0 자체는 정상일 수 있지만, `Trade WS 0/0`은 정상 대기가 아니다.
 
-## 2. 확인된 취약점
+## 2. 확인된 원인과 취약점
 
-### 2.1 빈 유니버스가 정상 결과처럼 조용히 통과
+### 2.1 직접 원인: 정상 `caution` 객체까지 모두 경보로 판정
+
+V3 base engine의 `_is_warning_market()`은 다음 순서로 `market_event.caution`을 처리했다.
+
+```text
+if caution is dict and any(bool(v) for v in caution.values()):
+    return True
+if bool(caution):
+    return True
+```
+
+Upbit의 정상 상세 응답에서 `caution`은 다섯 개 경보 Boolean을 가진 **비어 있지 않은 dict**다. 예를 들어 모든 경보가 false여도 객체 자체는 비어 있지 않다.
+
+따라서 첫 번째 조건은 false가 되더라도 바로 다음 `bool(caution)`은 항상 true가 된다. 결과적으로 `market_event.caution` 객체가 존재하는 정상 KRW 페어까지 전부 경보 종목으로 오인되었고, 안전 유니버스가 0개가 되었다.
+
+이 버그가 첨부된 실사용 화면의 `Trade WS 0/0`을 설명한다. WebSocket 자체가 먼저 실패한 것이 아니라 **WebSocket을 만들기 전에 모든 KRW 페어가 필터에서 제거**된 것이다.
+
+V3.0.1은 dict 자체의 truthiness를 사용하지 않고 각 경보 값을 명시적으로 해석한다. 모든 값이 false인 정상 caution 객체는 통과하고, 실제 true 경보가 하나 이상일 때만 제외한다.
+
+### 2.2 빈 유니버스가 정상 결과처럼 조용히 통과
 
 기존 base engine은 필터 결과가 빈 리스트이고 초기 `_allowed_markets`도 빈 리스트이면 변경이 없다고 판단하여 `_restart_global_streams()`도, `market_universe` 이벤트도 발생시키지 않았다. 결과적으로 UI는 0/0인 채 전략 대기처럼 보였다.
 
-### 2.2 경보 필드에 Python truthiness 사용
+V3.0.1은 KRW 페어가 존재하는데 안전하게 해석 가능한 종목이 0개면 정상 결과로 취급하지 않고 오류로 승격하여 원인 카운트를 로그에 남긴다.
 
-기존 `_is_warning_market()`은 `bool(value)` 계열 판단을 사용했다. JSON Boolean이면 문제가 없지만, 호환 계층/프록시/스키마 변화로 `"false"`, `"0"` 같은 문자열이 들어오면 Python에서는 모두 True가 된다. 이런 응답 변형이 생기면 정상 종목까지 전부 경보 종목으로 오인하여 유니버스가 0개가 될 수 있다.
+### 2.3 경보 값의 Python truthiness 의존 제거
+
+기존 구현은 `bool(value)` 계열 판단에 의존했다. JSON Boolean 외에 호환 계층/프록시/스키마 변화로 `"false"`, `"0"` 같은 문자열이 들어올 경우 Python에서는 비어 있지 않은 문자열이 모두 True가 되는 추가 위험도 있었다.
 
 V3.0.1은 명시적으로 알려진 true/false 표현만 해석한다. 알 수 없는 형식은 임의로 거래 가능하다고 추정하지 않고 해당 종목을 제외하며, 모든 KRW 종목을 안전하게 해석하지 못하면 명확한 오류를 기록한다.
 
-### 2.3 상세 조회 파라미터 호환성
+### 2.4 상세 조회 파라미터 호환성
 
 현재 Upbit 문서는 `is_details=true`를 사용한다. 다만 과거 API/클라이언트 예제에는 `isDetails=true` 표기가 널리 사용되어 왔다. V3.0.1은 첫 상세 조회 응답에 `market_event`가 전혀 없을 때만 legacy 표기로 1회 재조회한다. 이 재조회는 경보정보 없는 상태에서 LIVE 거래를 계속하는 것보다 안전한 호환 조치다.
 
-### 2.4 빈 유니버스 상태의 과도한 REST 재호출 가능성
+### 2.5 빈 유니버스 상태의 과도한 REST 재호출 가능성
 
 base loop는 `_allowed_markets`가 비어 있으면 다음 정기 갱신 시각과 무관하게 마켓 갱신을 다시 시도한다. 빈 결과가 예외 없이 반복될 경우 매우 빠른 반복호출이 가능했다. V3.0.1은 실패한 마켓 탐색에 10초 backoff를 둔다.
 
@@ -34,7 +55,7 @@ base loop는 `_allowed_markets`가 비어 있으면 다음 정기 갱신 시각�
 
 - Upbit market rows 응답 형식 검증
 - current `is_details` → 필요 시 legacy `isDetails` 1회 fallback
-- 명시적 market alert Boolean/string parser
+- `caution` dict 자체가 아니라 각 flag 값을 읽는 명시적 market alert parser
 - KRW 전체 수, 경보 제외 수, 형식 미확인 제외 수를 로그에 표시
 - 안전 유니버스 0개를 오류로 승격
 - 실패 시 10초 market-discovery retry backoff
