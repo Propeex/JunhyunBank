@@ -7,7 +7,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .config import AppConfig
-from .engine import TradingEngine
+from .runtime_engine import TradingEngine
 from .security import KeyStore
 from .ui import ApiKeyDialog, MainWindow
 from .upbit import UpbitClient
@@ -31,7 +31,7 @@ def main() -> int:
         if first_run.exec():
             access, secret = key_store.load()
         else:
-            QMessageBox.information(None, "API 키 필요", "JunhyunBank V2는 LIVE 전용입니다. API 키를 저장해야 프로그램을 사용할 수 있습니다.")
+            QMessageBox.information(None, "API 키 필요", "JunhyunBank V3는 LIVE 전용입니다. API 키를 저장해야 프로그램을 사용할 수 있습니다.")
             return 0
     client = UpbitClient(access, secret)
     try:
