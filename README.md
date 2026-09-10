@@ -1,4 +1,12 @@
-# JunhyunBank V4.0.2
+# JunhyunBank V4.0.3
+
+## V4.0.3 — Read-only forward-edge 검증 기반
+
+V4.0.3은 실거래 전략 임계값을 바꾸지 않고, 현재 JH-MicroFlow의 BUY 판단이 실제 미래 top-of-book에서 어떤 결과를 보이는지 측정하는 검증 도구를 추가합니다. `scripts/validate_public_edge.py`는 API Key를 읽지 않고 Public REST/WebSocket만 사용하며 **주문을 절대 제출하지 않습니다.**
+
+후보 평가 시점의 entry ask와 미래 bid를 연결해 양쪽 가정 수수료와 spread를 지불한 forward net return을 계산하고, BUY/전체 후보를 분리합니다. label 시점 호가가 늦으면 임의의 늦은 가격을 쓰지 않고 `missed`로 기록하며, 시간순 holdout 앞에서는 forward-label horizon만큼 training 표본을 purge해 시간 누수를 막습니다.
+
+상세 설계와 해석 제한: **[V4.0.3 Forward Edge Validation](docs/V4_0_3_EDGE_VALIDATION.md)**.
 
 ## V4.0.2 — Private 주문·자산 보조 reconciliation
 
@@ -43,6 +51,7 @@ V4.0.1은 거래 전략을 바꾸지 않는 배포 안정화 패치입니다. �
 - [`docs/V4_AUDIT.md`](docs/V4_AUDIT.md) — V4 런타임·주문·매수 경로 감사와 남은 과제
 - [`docs/V4_0_1_UPDATE_RECOVERY.md`](docs/V4_0_1_UPDATE_RECOVERY.md) — 업데이트 health handshake와 EXE+DB rollback
 - [`docs/V4_0_2_PRIVATE_RECONCILIATION.md`](docs/V4_0_2_PRIVATE_RECONCILIATION.md) — authenticated private stream과 event-driven REST reconciliation
+- [`docs/V4_0_3_EDGE_VALIDATION.md`](docs/V4_0_3_EDGE_VALIDATION.md) — 주문 없는 public forward-edge 수집과 purged chronological holdout
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 런타임/모듈/주문/업데이트 구조
 - [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md) — 전략 의도, 수식, 실제 구현과 미구현 설계
 - [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 리스크, P0/P1/P2 로드맵
@@ -136,13 +145,14 @@ V4 런타임은 `runtime_engine.TradingEngine`이 핵심 `engine.TradingEngine`�
 python -m pip install -e ".[dev]"
 pytest -q
 python scripts/smoke_upbit_public_ws.py --timeout 20 --attempts 3
+python scripts/validate_public_edge.py --seconds 1800 --output edge-validation.json
 python launcher.py
 ```
 
-Public WebSocket smoke test는 실제 Upbit 시장 탐색 후 선택한 KRW 페어의 체결과 호가를 받는지를 검증하며 **API Key와 주문 API를 사용하지 않습니다.** Private account WebSocket은 CI에 실계정 API Key를 넣지 않으므로 protocol/auth/reconciliation을 mock regression으로 검증하고, 실제 authenticated 연결은 설치 후 운영 로그에서 별도로 확인합니다.
+Public WebSocket smoke test와 forward-edge validator는 실제 Upbit Public REST/WebSocket만 사용하며 **API Key와 주문 API를 사용하지 않습니다.** Private account WebSocket은 CI에 실계정 API Key를 넣지 않으므로 protocol/auth/reconciliation을 mock regression으로 검증하고, 실제 authenticated 연결은 설치 후 운영 로그에서 별도로 확인합니다.
 
-`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public REST/WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.2` 등)를 생성합니다.
+`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public REST/WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.3` 등)를 생성합니다.
 
 ## 전략 검증에 대한 원칙
 
-코드/실서버 연결 테스트 통과는 수익성 검증을 뜻하지 않습니다. 현재 JH-MicroFlow의 실제 기대수익은 축적된 업비트 체결/호가 데이터에 수수료·슬리피지·주문지연을 반영한 워크포워드 검증으로 별도로 평가해야 합니다. 특히 현재 `ExpectedMove`는 아직 진정한 조건부 미래수익 모델이 아니라 최근 절대 변동폭 proxy라는 한계가 있습니다.
+코드/실서버 연결 테스트 통과는 수익성 검증을 뜻하지 않습니다. V4.0.3은 현재 전략의 forward edge를 주문 없이 측정할 수 있는 첫 기반이며, 아직 depth slippage·실제 주문지연·충분한 장기간 OOS를 포함한 완전한 수익성 검증은 아닙니다. 특히 현재 `ExpectedMove`는 진정한 조건부 미래수익 모델이 아니라 최근 절대 변동폭 proxy입니다.

@@ -1,299 +1,170 @@
-# V2 검증 상태와 개발 로드맵
+# V4.0.3 검증 상태와 개발 로드맵
 
-기준 버전: **V2 / 2.0.0**
+이 문서의 목적은 **무엇이 구현됐는가보다 무엇을 아직 믿으면 안 되는가**를 명확히 유지하는 것이다.
 
-이 문서의 목적은 “무엇이 완료됐는가”보다 **무엇을 아직 믿으면 안 되는가**를 명확하게 남기는 것입니다.
-
----
-
-## 1. 검증을 세 종류로 구분한다
+## 1. 검증을 네 층으로 구분한다
 
 ### A. 코드 검증
 
 - import/문법
-- 단위테스트
-- 핵심 함수 규칙
-- GitHub CI
+- unit/regression test
+- 주문/관리수량/업데이트 불변조건
+- Windows + Ubuntu GitHub CI
 
 ### B. 배포 검증
 
 - Windows runner 설치
 - pytest
+- 실제 Upbit Public REST/WebSocket smoke
 - PyInstaller build
-- GitHub Release
-- asset digest
+- GitHub Release / asset digest
 
-### C. 전략 수익성 검증
+### C. 실거래 안전성 검증
 
-- 실제 체결/호가 데이터
-- 수수료
-- 슬리피지
+- durable order intent
+- ambiguous POST 복구
+- partial fill accounting
+- restart recovery
+- 사용자 보유분 보호
+- Private account event + REST reconciliation
+- updater health verification/rollback
+
+### D. 전략 수익성 검증
+
+- 실제 시장의 미래 label
+- 실제 수수료/spread/slippage
 - 주문 지연
-- train/OOS 분리
+- purged train/validate/OOS
 - regime별 성과
-- MDD / tail loss
+- MDD/tail loss
+- parameter sensitivity
 
-**현재 V2는 A/B는 통과했지만 C는 아직 충분히 완료되지 않았습니다.**
+V4.0.3 기준 A/B와 C의 주요 구조는 크게 보강됐다. **D는 아직 초기 단계다.** 코드와 릴리즈가 성공했다는 사실을 수익성이 검증됐다는 의미로 사용하지 않는다.
 
-따라서 “V2 빌드가 성공했다”와 “V2가 수익성이 있다”를 절대 같은 뜻으로 사용하지 않습니다.
+## 2. V4까지 완료한 핵심 안전성 작업
 
----
+### 주문 상태 머신
 
-## 2. 현재 완료된 검증
+V4.0.0부터:
 
-V2 개발 과정에서:
+- 주문 제출 전에 unique identifier와 주문 의도를 SQLite에 저장.
+- timeout/5xx/응답 유실에서 동일 주문 자동 재전송 금지.
+- identifier 기반 REST reconciliation.
+- terminal 여부와 실제 trades 확인 후에만 체결 반영.
+- partial fill의 실제 수량·금액·수수료 원자 기록.
+- pending 주문이 있으면 신규매수 차단.
+- 재시작 후 pending 복구.
+- POST 429 자동 재시도 금지.
 
-- PR CI pytest 통과
-- 보강 수정 후 PR CI 재통과
-- main push pytest 통과
-- Windows release workflow pytest 통과
-- Windows PyInstaller `JunhyunBank.exe` build 성공
-- V2 GitHub Release 생성 성공
-- Release asset SHA-256 digest 존재 확인
+### managed quantity 보호
 
-V2 Release:
+- JunhyunBank가 직접 체결한 수량만 자동관리.
+- 0/NULL managed quantity를 계정 총잔고로 추정하지 않음.
+- 부분매도 후 남은 managed quantity만 계속 관리.
+- 사용자 별도 보유분이 있어도 관리수량 외 매도를 금지하는 회귀테스트 유지.
 
-- tag: `V2`
-- target commit: `12b7e50148e9e4567603d3928fc16c8c4d984787`
-- asset: `JunhyunBank.exe`
-- size: `71,485,066 bytes`
-- SHA-256: `10d2e5fdcccb92a2332685e70db6a7b69ec6cd76f1dc03b5bccb93b894645121`
+### 런타임 데이터
 
-테스트가 확인하는 대표 규칙:
+- Public WebSocket Origin 제거와 reconnect.
+- 시장 discovery 실패 backoff 및 fail-closed alert parsing.
+- deep orderbook subscription을 후보 변경마다 재연결하지 않고 live update.
+- deep 재진입 종목의 stale book state 제거.
+- 시세/워밍업/후보/orderbook 상태 UI 진단.
+- stale trade/orderbook 신규진입 차단.
 
-- 동적 주문금액에 임의 고정 KRW cap이 없음
-- stale market data 신규진입 차단
-- exchange minimum 미달 차단
-- emergency/API failures 차단
-- warning market 분류
-- orderbook slippage/capacity 계산 기본 동작
-- Strategy Health negative sequence stop
-- managed position state persistence
-- strategy outcome persistence
-- cost gate
-- high quality entry
-- emergency stop distance 고정 의도
-- 체결 없는 초를 wall-clock frame으로 보정
-- updater release tag parsing
+### updater
 
----
+V4.0.1부터:
+
+- 새 EXE digest 확인.
+- 기존 EXE + SQLite DB/WAL/SHM snapshot.
+- `--post-update-verify` 비거래 부팅으로 DB migration/quick_check 검증.
+- health marker 실패 시 EXE+DB 함께 rollback.
+- 검증 성공 전 LIVE 자동재개 금지.
+
+### Private account reconciliation
+
+V4.0.2부터:
+
+- authenticated `myOrder` + `myAsset` 단일 WebSocket.
+- fresh JWT/reconnect/ping 및 credential redaction.
+- JunhyunBank identifier 주문 이벤트만 pending reconciliation을 즉시 깨움.
+- WebSocket을 회계 정본으로 쓰지 않고 REST identifier 조회를 정본으로 유지.
+- Private WS 장애 시 REST fallback.
+- pending REST 조회 failure backoff.
+- `myAsset`은 balance-change signal일 뿐 managed quantity 추정에 사용하지 않음.
 
 ## 3. 현재 가장 중요한 미검증 사실
 
-### 전략의 `ExpectedMove`는 아직 진짜 기대수익 모델이 아니다
+### `ExpectedMove`는 아직 조건부 기대수익 모델이 아니다
 
-현재:
-
-```text
-expected_move = recent |30s returns| 70th percentile
-```
-
-입니다.
-
-이 값은 “현재 신호가 앞으로 상승할 조건부 기대수익”이 아니라 최근 시장의 **절대 움직임 크기**입니다.
-
-그런데 현재 capital sizing의 `edge`는 이 값을 거래비용과 비교합니다.
+현재 구현은 대략 다음 성격이다.
 
 ```text
-edge = (expected_move - cost) / expected_move
+ExpectedMove = recent |30s return| distribution의 70% quantile 계열
 ```
 
-따라서 current signal의 실제 방향성 성공확률이 충분히 검증되지 않은 상태에서 **변동성 용량을 기대수익처럼 사용**하는 근본적 한계가 있습니다.
+즉 “현재 BUY 신호 뒤에 앞으로 얼마나 오를 것인가”가 아니라 최근의 **절대 움직임 크기 proxy**다.
 
-이것은 V2 수익성 검증에서 가장 먼저 다뤄야 할 전략 이슈입니다.
+현재 entry logic은 이 값을 거래비용과 비교하고 capital sizing에도 사용한다. 방향성 성공확률과 조건부 net expectancy가 충분히 검증되기 전에는 이를 진정한 edge라고 부르면 안 된다.
 
----
+## 4. V4.0.3 Forward Edge Validator
 
-## 4. P0 — 실전 안전성 관점에서 최우선 점검
+V4.0.3은 이 문제를 해결하기 위한 첫 연구 계측 기반이다.
 
-### P0-1. End-to-end 주문 상태 머신
+`python scripts/validate_public_edge.py --seconds 1800 --output edge-validation.json`
 
-현재 주문 제출 후 REST `GET /v1/order`를 약 8초 grace 동안 polling합니다.
+특징:
 
-점검해야 할 상황:
+- API Key를 읽지 않는다.
+- 주문 API를 호출하지 않는다.
+- 실제 Public trade/orderbook으로 현재 `MicroFlowStrategy`를 워밍업한다.
+- 후보 평가 시점의 entry bid/ask와 특징/decision을 기록한다.
+- 미래 horizon의 bid/ask로 label한다.
+- long shadow net return은 **entry ask → future bid**, 양쪽 assumed fee를 포함한다.
+- label quote가 허용 지연창을 넘기면 늦은 가격을 대신 쓰지 않고 `missed`로 기록한다.
+- live와 동일한 3초 stale gate를 적용한다.
+- deep 재진입 시 old orderbook history/quote를 제거한다.
+- BUY와 전체 후보 통계를 분리한다.
+- ExpectedMove calibration을 측정한다.
+- 각 horizon의 train/holdout 사이에서 forward-label overlap 구간을 purge한다.
 
-- POST 주문은 거래소에 도달했지만 client timeout
-- accepted response는 받았지만 subsequent GET 실패
-- IOC partial fill
-- cancel state와 executed volume 조합
-- 앱 crash 직후 pending order
-- updater/Windows 종료와 order settlement가 겹침
+이 validator도 아직 다음을 모델링하지 않는다.
 
-현재 `identifier`는 고유하지만, ambiguous POST 결과에서 identifier로 자동 reconciliation하는 완전한 durable state machine은 없습니다.
+- 주문 크기별 L2 depth walk/slippage
+- queue position
+- 실제 REST/WebSocket 주문 latency
+- 실제 계정별 fee
+- available KRW / held market / pending order
+- 실제 Strategy Health history
 
-**개선 권장:**
+따라서 V4.0.3의 BUY는 **전략 1차 BUY 판단 표본**이다. 실제 주문 체결 성과가 아니다.
 
-- pending_orders 테이블
-- 주문 제출 전 identifier 영속화
-- uuid/identifier 양쪽 조회 reconciliation
-- terminal state 확인 전 동일 market 신규주문 차단
-- restart recovery
-- private myOrder WebSocket 병행
+## 5. V4.0.3 결과를 볼 때 최소 조건
 
-### P0-2. 관리수량 보호의 실제 계정 테스트
+한 세션의 평균수익만 보고 판단하지 않는다. 최소한 다음을 함께 본다.
 
-의도는 기존 보유자산을 건드리지 않는 것이지만 실제 계정에서 아래를 검증해야 합니다.
+- `orders_submitted == 0` 확인.
+- WebSocket 오류가 과도하지 않은지.
+- horizon별 label completion rate.
+- missed label 비율.
+- BUY 표본 수.
+- BUY mean/median net return과 positive rate.
+- 전체 후보와 BUY의 차이.
+- train BUY와 holdout BUY의 차이.
+- purged training 표본 수.
+- ExpectedMove coverage/correlation/observed-to-expected ratio.
+- 특정 종목/짧은 시간대에 결과가 몰리는지.
 
-- 기존에 KRW-XYZ 10개 보유
-- JunhyunBank가 2개 추가 매수
-- 관리수량 2개만 매도하는지
-- 사용자가 중간에 직접 추가매수/매도한 경우 reconciliation
-- locked balance가 있는 경우
+BUY 수가 몇 건뿐이면 방향성 결론을 내리지 않는다. label completion이 낮으면 전략보다 데이터 파이프라인을 먼저 고친다.
 
-### P0-3. 지나치게 큰 자금배분 가능성
+## 6. 다음 P1 — Raw Market Data Recorder
 
-고정 주문한도가 없다는 사용자 요구는 유지해야 하지만, 현재 capital fraction은 최대 1입니다.
+다음 우선순위는 **장기 recorder**다. V4.0.3 validator의 online sample만으로는 같은 시장경로에서 여러 전략 후보를 반복 비교할 수 없다.
 
-조건이 강하면 가용 KRW의 상당 부분을 한 market에 배분할 수 있습니다.
+최소 저장 데이터:
 
-특히 현재 `edge`가 진정한 conditional expected return이 아니라 volatility proxy 기반이라는 점과 결합하면 위험합니다.
-
-**사용자 요구를 훼손하지 않는 개선 방향:**
-
-고정 “최대 N원”이 아니라 bootstrap uncertainty, observed edge confidence, portfolio correlation, liquidity와 drawdown distribution을 이용해 **데이터 기반 risk budget**을 계산합니다.
-
-### P0-4. Update 후 실제 실행 실패 rollback
-
-현재 updater는 파일 교체 실패에는 rollback을 시도합니다.
-
-하지만 새 EXE를 `Start-Process`한 뒤 2초 후 `.old`를 삭제합니다.
-
-새 EXE가 시작되자마자 crash하거나 API migration 오류가 나도 old executable을 자동 복원하는 health handshake는 없습니다.
-
-**개선 권장:**
-
-- 새 버전이 `update-success` marker를 쓰기 전까지 old 보존
-- timeout 내 marker 없으면 updater가 new 종료 + old 복구
-- DB migration backward compatibility 고려
-
----
-
-## 5. P1 — 전략/운영 품질상 중요한 문제
-
-### P1-1. Deep orderbook stream churn
-
-현재 후보 목록이 바뀌면 `_restart_deep_stream()`이 **전체 deep WebSocket을 stop 후 새로 생성**합니다.
-
-candidate refresh 기본값은 3초입니다.
-
-Hot 순위가 자주 바뀌면:
-
-- WebSocket reconnect 빈도 증가
-- orderbook message gap
-- `_book_history` continuity 약화
-- BookQ delta percentile 품질 저하
-- stale gate 증가
-
-가 발생할 수 있습니다.
-
-**개선 권장:**
-
-- 후보 변경 hysteresis
-- 최소 residency time
-- subscription set 변경을 덜 자주 수행
-- stable core + rotating candidates 분리
-- 또는 여러 persistent shard 사용
-
-### P1-2. Strategy Health = 0의 자동 복귀 문제
-
-현재 health=0이면 신규진입하지 않습니다.
-
-열린 포지션도 없으면 새로운 outcome이 생기지 않으므로 health가 스스로 회복될 근거가 없습니다.
-
-**개선 권장:**
-
-- shadow/virtual trade engine
-- health=0에서 동일 신호를 실제 주문 없이 기록
-- 충분한 shadow sample의 conditional expectancy 회복 시 단계적 exposure 복원
-
-### P1-3. Strategy outcome이 partial exit를 정확히 반영하지 않음
-
-현재 포지션이 여러 IOC에 걸쳐 부분청산되더라도 마지막 잔여수량이 종료될 때 마지막 `avg_price`를 이용해 전체 `net_return`을 계산합니다.
-
-따라서 여러 partial sell의 가중평균 실제 exit price와 전체 paid fee가 Strategy Health outcome에 완전히 반영되지 않습니다.
-
-**개선 권장:**
-
-- position ledger에 cumulative sold quantity
-- cumulative sell proceeds
-- cumulative fees
-- realized weighted exit price
-- 실제 net PnL / actual initial risk
-
-### P1-4. Private WebSocket 미사용
-
-현재 public trade/orderbook WebSocket + private REST입니다.
-
-Upbit private `myOrder`, `myAsset`를 사용하면:
-
-- fill event latency 감소
-- polling 감소
-- partial fill state 명확화
-- external/manual balance change 감지
-
-에 도움이 됩니다.
-
-REST reconciliation은 fallback/source-of-truth 검증으로 남기는 편이 좋습니다.
-
-### P1-5. Raw market data recorder 부재
-
-현재 전략 rolling data는 memory-only입니다.
-
-앱 종료 시 사라지고 수익성 연구에 필요한 과거 L2 상태를 재생할 수 없습니다.
-
-**최우선 연구 인프라:**
-
-- raw trade events
-- orderbook snapshots/deltas
-- receive timestamp + exchange timestamp
-- selected candidate status
-- strategy features
-- decisions
-- order submissions/fills
-
-을 저장합니다.
-
-### P1-6. V1→V2 managed quantity migration
-
-V1 DB에는 managed quantity가 없었습니다.
-
-V2가 V1 marker를 발견하면 현재 해당 market의 **계정 총수량**을 관리수량으로 채우는 fallback이 있습니다.
-
-사용자가 V1 관리포지션과 같은 코인을 별도 추가매수한 이력이 있다면 보호경계가 불명확할 수 있습니다.
-
-migration UI/reconciliation을 추가하거나 legacy marker를 자동매도 대신 사용자 확인 대상으로 처리하는 방안을 검토합니다.
-
-### P1-7. API failure counter가 endpoint별 상태를 구분하지 않음
-
-현재 성공하는 private API 호출 하나가 전역 `api_failures`를 0으로 reset합니다.
-
-특정 중요 endpoint가 반복 실패해도 다른 endpoint가 성공하면 연속 실패 guard가 잘 동작하지 않을 수 있습니다.
-
-**개선:** order/account/market-data별 circuit breaker 분리.
-
----
-
-## 6. P2 — 품질/분석성 개선
-
-- 모든 entry/hold/exit feature snapshot 구조화 저장
-- UI에서 현재 선택 종목 chart 변경
-- 현재 Entry Quality / expected cost / regime / health 표시
-- 거래별 이유와 실제 체결비용 리포트
-- 일/주/월 성과 summary
-- signal kind별 통계
-- regime별 통계
-- live vs simulated slippage 오차
-- updater progress bar
-- automatic diagnostic bundle export
-- code signing / SmartScreen 개선
-
----
-
-## 7. 전략 수익성 검증을 위해 필요한 데이터
-
-### 최소 저장 데이터
-
-#### trade
+### trade
 
 - market
 - exchange timestamp
@@ -301,9 +172,9 @@ migration UI/reconciliation을 추가하거나 legacy marker를 자동매도 대
 - price
 - volume
 - aggressor side
-- sequential id 가능 시 저장
+- sequential id가 제공되면 저장
 
-#### orderbook
+### orderbook
 
 - market
 - exchange timestamp
@@ -311,162 +182,167 @@ migration UI/reconciliation을 추가하거나 legacy marker를 자동매도 대
 - 최소 상위 5 level, 가능하면 15~30 level
 - bid/ask price and size
 
-#### features
+### strategy/decision
 
-평가시점마다:
-
-- ActivityQ
-- AggressionQ
-- BookQ
-- MomentumQ
+- candidate rank/HotScore
+- ActivityQ/AggressionQ/BookQ/MomentumQ
 - Quality
 - spread
-- expected_move
+- ExpectedMove
 - realized volatility
 - regime
-- health
+- decision/reason
 
-#### decision/order
+### execution linkage
 
-- HOLD/BUY/SELL
-- reason
-- capital fraction
-- requested KRW
-- liquidity capacity
-- predicted buy/sell slippage
-- identifier/uuid
-- actual fills
-- actual fee
+실거래 이벤트를 recorder 데이터와 연결할 수 있게 identifier/uuid, request time, accepted time, fills/fee도 별도 ledger와 연결한다. 단, raw market recording이 주문 thread를 block해서는 안 된다.
 
----
+Recorder 설계 요구:
 
-## 8. 권장 검증 절차
+- bounded queue
+- writer thread/process 분리
+- drop count/queue lag 진단
+- crash-safe file rotation
+- 압축
+- 디스크 용량 상한/retention
+- format schema version
 
-### Phase 1 — Recorder 안정화
+## 7. 다음 P1 — Deterministic Replay
 
-적어도 여러 시장상태가 포함되게 데이터를 수집합니다.
+Recorder 다음에는 동일 raw events를 전략에 재생하는 replay가 필요하다.
 
-초기 목표로 최소 14일 이상을 제안하지만, 날짜 자체보다:
+핵심 요구:
 
-- 평일/주말
-- 저변동/고변동
-- 시장 상승/하락
-- 급등/급락 event
+- 이벤트의 원래 시간순서 보존.
+- exchange/local receive timestamp 선택 가능.
+- `time.monotonic()`/`time.time()`에 직접 묶인 전략 의존성을 injectable clock으로 분리.
+- 동일 fixture를 여러 번 재생하면 동일 feature/decision 결과.
+- current strategy와 candidate strategy를 **같은 입력 경로**에서 비교.
+- 실제 당시 orderbook으로 size별 execution simulation.
 
-가 포함되는 것이 중요합니다.
+Replay가 없으면 threshold 변경 전후를 서로 다른 시장 구간에서 비교하는 오류를 피하기 어렵다.
 
-### Phase 2 — Event labeling
+## 8. Walk-forward / OOS 계획
 
-각 candidate signal 시점 이후:
-
-- +5s
-- +10s
-- +30s
-- +60s
-- +180s
-
-forward return, MFE, MAE를 계산합니다.
-
-그 다음 현재 Quality가 실제로 조건부 미래수익/성공확률을 높이는지 검증합니다.
-
-### Phase 3 — Execution simulation
-
-당시 orderbook을 사용해:
-
-- requested size
-- partial fill
-- spread
-- depth walk
-- fee
-
-를 재현합니다.
-
-### Phase 4 — Walk-forward
-
-시간순서 유지:
+시간순서를 유지한다.
 
 ```text
 TRAIN → VALIDATE → OOS
 ```
 
-random shuffle split은 시장시계열 검증에 부적합합니다.
+random shuffle split은 사용하지 않는다.
 
-rolling/purged walk-forward를 사용합니다.
+권장 절차:
 
-### Phase 5 — Stress
+1. 여러 시장상태를 포함한 recorder 데이터 축적.
+2. event labeling과 current baseline 측정.
+3. TRAIN에서만 후보 모델/parameter 제안.
+4. VALIDATE에서 후보를 줄이고 parameter plateau 확인.
+5. untouched OOS에서 최종 비교.
+6. rolling/purged walk-forward 반복.
 
-최소:
+forward horizon label이 다음 fold와 겹치지 않도록 purge/embargo를 둔다.
+
+## 9. Stress 요구
+
+전략 변경 후보는 최소 다음 stress에서 쉽게 붕괴하지 않아야 한다.
 
 - fee × 1.0 / 1.25 / 1.5
-- execution delay +100 / +250 / +500 ms
-- slippage model 악화
-- feature threshold ±20~30%
-- 특정 상위 수익 코인 제거
-- 최고 수익일 제거
+- execution delay +100 / +250 / +500ms
+- depth slippage 악화
+- partial fill
+- threshold 주변 ±20~30% sensitivity
+- 특정 최고 수익 코인 제거
+- 최고 수익일/이벤트 제거
+- 상승/하락/저변동/고변동 regime 분리
 
-### Phase 6 — 선택 기준
+가장 높은 backtest 수익 하나가 아니라 넓은 parameter 영역의 안정성을 본다.
 
-가장 높은 백테스트 수익 하나가 아니라 **넓은 parameter 영역에서 안정적인 설정**을 선택합니다.
+## 10. Conditional ExpectedMove와 sizing
 
----
+충분한 recorder/replay/OOS 이후에만 진행한다.
 
-## 9. 채택/기각 기준의 예
+후보 방향:
 
-정확한 숫자는 데이터가 쌓인 뒤 정하되 기본 철학은 다음과 같습니다.
+- 현재 features를 조건으로 한 forward-return distribution.
+- direction probability + expected gain/loss 분리.
+- calibration과 uncertainty interval.
+- bootstrap lower confidence edge.
+
+새 estimator가 current volatility proxy보다 OOS에서 일관되게 개선될 때만 live candidate로 고려한다.
+
+그 다음 자금배분은 고정 KRW cap 대신 다음을 사용해 보수화할 수 있다.
+
+- bootstrap lower-bound edge
+- damped Kelly류
+- liquidity capacity
+- recent drawdown/tail loss
+- portfolio/BTC beta correlation
+
+데이터 없이 Kelly/correlation 모델부터 구현하지 않는다.
+
+## 11. Strategy Health 후속
+
+현재 Strategy Health는 실제 strategy outcomes에 기반한다. health=0이고 신규 거래가 없으면 실제 outcome만으로 자연 회복하기 어렵다.
+
+장기 recorder/replay 기반이 생긴 뒤 shadow decision 성과를 별도 상태로 축적해 **실거래 health와 섞지 않고** recovery evidence로 사용하는 설계를 검토한다.
+
+shadow 결과를 실제 PnL처럼 DB에 섞거나 health를 자동으로 강제 해제하면 안 된다.
+
+## 12. 아직 실제 환경에서 추가 확인할 것
+
+- Private authenticated WS의 장시간 운영 안정성. CI에는 실계정 secret을 주입하지 않는다.
+- 사용자가 직접 같은 코인을 추가 매수/매도한 복잡한 운영 시나리오.
+- locked balance가 큰 경우 managed sell 가능량 처리.
+- Windows 업데이트 verify/rollback을 실제 사용자 경로에서 반복 검증.
+- 장시간 24/7 운전 시 메모리/스레드/DB/로그 성장.
+- 최소주문 미만 dust managed position 때문에 DRAINING이 오래 유지되는 UX.
+
+## 13. 채택/기각 기준의 철학
 
 채택하려면:
 
-- out-of-sample net expectancy > 0
-- 비용 증가 stress에서도 쉽게 음수로 붕괴하지 않음
-- delay stress 내성
-- 특정 한 코인/하루 의존도가 과도하지 않음
-- parameter 주변 영역에서도 성능이 유사
-- drawdown/tail loss가 감당 가능한 구조
-- 실제 fill과 simulated fill 차이가 통제됨
+- OOS net expectancy가 양수.
+- 충분한 표본과 label quality.
+- 비용/지연 stress에서 쉽게 음수로 붕괴하지 않음.
+- 특정 한두 코인/날짜에 의존하지 않음.
+- 주변 parameter에서도 유사한 성능.
+- drawdown/tail loss가 통제 가능.
+- simulated fill과 실제 fill 오차가 장기적으로 측정/보정 가능.
 
 기각해야 할 패턴:
 
-- training에서만 좋음
-- threshold를 아주 조금 바꾸면 붕괴
-- 거래비용 미적용 시에만 플러스
-- 한두 번의 급등 거래가 전체 수익 대부분
-- 실체결 지연을 넣으면 기대값 소멸
+- training에서만 좋음.
+- threshold를 조금만 바꾸면 붕괴.
+- fee/spread를 빼야만 플러스.
+- 몇 번의 급등이 전체 수익의 대부분.
+- execution delay를 넣으면 edge 소멸.
+- label completion이 낮은데 누락을 무시한 채 성과를 계산.
 
----
+## 14. 현재 우선순위
 
-## 10. 권장 V3 우선순위
+1. **V4.0.3 forward-edge validator 안정화/여러 세션 수집**
+2. **Raw Market Data Recorder**
+3. **Deterministic Replay Engine**
+4. **Purged Walk-forward + execution stress harness**
+5. **Conditional ExpectedMove 후보 모델**
+6. **Uncertainty-aware dynamic sizing**
+7. **Correlation-aware portfolio allocation**
+8. **Shadow Health recovery evidence**
+9. 운영 리포트/진단 bundle/장기 관측성 개선
 
-현재 기준으로 V3를 만든다면 아래 순서를 권장합니다.
+중요: 5~8은 2~4가 충분히 준비된 뒤 진행한다. 데이터 없이 모델을 복잡하게 만드는 것은 정교한 과최적화가 될 가능성이 높다.
 
-1. **Market Data Recorder + Replay Engine**
-2. **Durable Order/Fill State Machine + private myOrder/myAsset**
-3. partial fill 기반 정확한 position/PnL ledger
-4. deep stream churn 개선
-5. shadow Strategy Health recovery
-6. conditional edge estimator
-7. bootstrap/damped Kelly 또는 이에 준하는 uncertainty-aware sizing
-8. correlation-aware portfolio allocation
-9. UI에 전략 근거/실제비용/건강도 상세 표시
-10. update health handshake rollback
-
-중요: 6~8은 1의 데이터가 충분히 쌓인 뒤 해야 합니다. 데이터 없이 복잡한 모델을 먼저 넣으면 정교해 보이는 과최적화가 될 가능성이 큽니다.
-
----
-
-## 11. 현재 평가
+## 15. 현재 평가
 
 ### 구현 완성도
 
-V1 대비 큰 발전이 있으며 기본 lifecycle, updater, managed position 보호, 실시간 MicroFlow pipeline의 골격은 갖춰져 있습니다.
+V4.0.0~V4.0.2에서 실거래 자동매매의 주문 복구, 부분체결, managed quantity 보호, updater rollback, Private account 보조 reconciliation이 크게 강화됐다.
 
 ### 실전 운영 완성도
 
-실거래 프로그램이라는 기준에서는 주문상태 reconciliation과 관측가능성(observability)을 더 강화할 필요가 있습니다.
+초기 V2/V3보다 높지만 24/7 장기 실제 사용자 환경 검증과 복잡한 manual balance interaction은 더 필요하다.
 
 ### 전략 검증 완성도
 
-**낮음~초기 단계.**
-
-현재 규칙은 논리적으로 구성된 초기 MicroFlow hypothesis이며 장기간의 실제 Upbit L2 기반 수익성 검증이 아직 없습니다.
-
-다음 개발자는 이 사실을 숨기거나 “검증된 수익전략”이라고 표현하지 마세요.
+**초기 계측 단계.** V4.0.3은 기존 “논리적으로 그럴듯한 MicroFlow 가설”을 실제 미래 bid/ask로 측정하기 시작한 단계다. 충분한 recorder/replay/purged OOS가 쌓이기 전에는 “검증된 수익전략”이라고 표현하지 않는다.

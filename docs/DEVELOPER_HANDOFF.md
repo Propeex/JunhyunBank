@@ -1,395 +1,241 @@
-# 현재 기준: V4.0.0
+# JunhyunBank 개발 인수인계 — V4.0.3 기준
 
-먼저 [V4 감사 및 구현 변경](V4_AUDIT.md)을 읽으세요. 아래 V2 문서는 역사적 설계 기록입니다. 주문 복구·관리 수량·재시작·릴리즈 태그 설명은 V4 문서가 우선합니다. 현재 릴리즈 태그는 전체 버전 V4.0.0 형태입니다.
+이 문서는 이전 대화가 모두 사라져도 새 개발자 또는 새 ChatGPT가 제품의 의도, 안전 불변조건, 현재 구현과 다음 작업을 바로 이어갈 수 있도록 유지하는 최우선 인수인계 문서다.
 
-# JunhyunBank 개발 인수인계 문서
+코드와 문서가 충돌하면 **현재 `main` 코드가 source of truth**다. V4의 주문/복구는 `V4_AUDIT.md`, 업데이트는 `V4_0_1_UPDATE_RECOVERY.md`, Private account reconciliation은 `V4_0_2_PRIVATE_RECONCILIATION.md`, 전략 검증은 `V4_0_3_EDGE_VALIDATION.md`를 함께 읽는다.
 
-작성 기준: **V2 / 2.0.0**, `main` 기준 릴리즈 V2 이후.
+## 1. 제품 한 줄 정의
 
-이 문서는 이전 대화가 모두 사라져도 새 개발자 또는 새 ChatGPT가 JunhyunBank의 목적, 구현 의도, 안전 원칙, 현재 상태와 다음 작업을 이해하고 바로 개발을 이어갈 수 있도록 작성했습니다.
+JunhyunBank는 Upbit KRW 마켓을 24시간 실시간 감시하고 체결/호가 기반 단기 수급 신호를 찾아 **실제 원화로 자동 매수·매도하는 Windows LIVE 전용 데스크톱 프로그램**이다.
 
----
+모의매매(PAPER) 모드는 V2부터 제거됐다. 앱의 `시작`은 실제 주문을 허용하므로 테스트/진단 도구와 실거래 경로를 명확히 분리해야 한다.
 
-## 1. 프로젝트 한 줄 정의
+## 2. 반드시 유지할 사용자 요구
 
-**JunhyunBank는 Upbit KRW 마켓을 24시간 실시간 감시하고, 체결/호가 기반 단기 모멘텀을 찾아 실제 원화로 자동 매수·매도하는 Windows 데스크톱 프로그램입니다.**
+- LIVE 전용 자동매매.
+- 시장 전체를 지속 감시하고 종목·진입·청산을 프로그램이 스스로 결정.
+- 핵심은 짧은 수급/호가 기반 단타.
+- `시간당 N회`, `1회 최대 N원`, `최대 N종목` 같은 임의의 고정 전략 cap을 추가하지 않음.
+- 대신 신호 품질, 시장 regime, 실제 거래비용, 호가 유동성, Strategy Health를 이용해 동적으로 거래 여부와 자금배분을 결정.
+- 사용자가 프로그램 실행 전부터 보유한 코인을 JunhyunBank가 임의로 매도하지 않음.
+- 일반 `종료`는 신규매수만 막고 관리 포지션을 전략대로 청산한 후 종료하는 DRAINING.
+- `긴급 정지`는 즉시 전략/신규주문을 멈추지만 보유자산 강제 시장가 청산 기능이 아님.
+- 보유자산 UI에 KRW 표시.
+- GitHub Release 기반 `업데이트` 버튼과 자동 재시작.
+- 업데이트 후 API Key와 SQLite 관리상태 유지.
 
-V2부터는 모의매매(PAPER) 모드를 제거하고 LIVE 실전매매 전용으로 운영합니다.
+## 3. 절대 깨면 안 되는 안전 불변조건
 
----
+1. 출금 API를 구현하지 않는다.
+2. Access Key / Secret Key / JWT를 GitHub, SQLite, 로그에 저장하지 않는다.
+3. API Key는 OS keyring에만 저장한다.
+4. 자동매도는 JunhyunBank가 실제 체결로 확보한 `managed_quantity` 범위에만 적용한다.
+5. `managed_quantity`가 0/NULL이면 계정 총잔고를 대신 넣어 추정 매도하지 않는다.
+6. 주문 전 unique `identifier`를 SQLite `order_intents`에 먼저 영속화한다.
+7. timeout/5xx/응답 유실 같은 ambiguous POST 결과에서 같은 주문을 재전송하지 않는다. identifier로 reconciliation한다.
+8. terminal 체결 확인 전 동일 시장의 중복 주문을 막고 pending이 있으면 신규매수를 차단한다.
+9. partial fill은 실제 trades의 수량·금액·수수료만 원자적으로 반영한다.
+10. Private `myOrder`/`myAsset`은 빠른 변화 신호일 뿐 회계 정본이 아니다. 체결 정본은 identifier REST 조회다.
+11. public/private WebSocket이 끊겨도 무조건 거래를 계속하지 않는다. stale trade/orderbook에서는 신규매수 금지.
+12. 경보 또는 해석 불가능한 시장은 신규진입에서 fail-closed 한다. 이미 관리 중인 포지션의 감시/청산은 유지한다.
+13. 반복 API 오류, 최소 주문금액 미달, 비정상 NaN/inf 입력에서 신규주문을 막는다.
+14. 업데이트는 새 EXE/DB 사전검증이 성공한 뒤에만 정상 재개하고 실패하면 EXE+DB snapshot을 함께 rollback한다.
+15. 검증을 이유로 실제 전략 threshold를 임의 완화하지 않는다. 데이터와 OOS 근거가 먼저다.
 
-## 2. 사용자가 원하는 제품 방향
+## 4. 현재 버전 계보
 
-사용자는 비개발자이며, 세부 기술 선택은 개발자가 판단해 완성도 높은 형태로 구현하는 것을 선호합니다. 기능 요구를 받으면 불필요한 기술 질문을 반복하기보다 제품 의도를 해석해 적절한 구조를 설계하고 구현합니다.
+### V4.0.0
 
-### 반드시 유지할 사용자 요구
+- 런타임 재시작/시세 진단 보강.
+- 동일 5초 수급 비교 수정.
+- 종목별 매수 대기 사유와 진입 Q/비용 표시.
+- durable `order_intents`, identifier 복구, partial fill atomic accounting.
+- 중복주문/사용자 보유분 보호.
 
-1. **V2 이후 오직 실전(LIVE) 모드만 사용**
-2. 프로그램이 Upbit 시장을 24시간 지속 감시하고 스스로 종목/진입/청산을 판단
-3. 단타 전략이 핵심
-4. `시간당 N회`, `1회 최대 N원`, `최대 N종목` 같은 임의의 고정 거래한도를 전략에 두지 않음
-5. 대신 신호 품질, 시장상태, 거래비용, 유동성, 전략 건강도를 이용해 거래 여부와 주문금액을 동적으로 결정
-6. **업데이트 버튼**으로 최신 GitHub Release의 `JunhyunBank.exe`를 내려받아 현재 파일을 교체하고 자동 재시작
-7. 업데이트 후 API Key를 다시 입력하지 않아야 함
-8. 보유자산 목록에 KRW 원화도 표시
-9. UI에서 보유자산은 넓게, 운영로그는 좁게 배치
-10. 일반 `종료`를 누르면 신규매수만 즉시 중단하고, JunhyunBank 관리 포지션은 전략 청산이 끝날 때까지 계속 관리한 뒤 종료
-11. `긴급 정지`는 일반 종료와 별개이며 즉시 전략/신규주문을 멈추되 보유자산을 강제 시장가 청산하지 않음
-12. 사용자가 프로그램 실행 전부터 갖고 있던 코인을 JunhyunBank가 임의로 매도하지 않음
-13. 완성 버전은 **V1, V2, V3 ...** 형태로 GitHub Release 발행
+### V4.0.1
 
----
+- updater를 복구 가능한 트랜잭션으로 변경.
+- 새 EXE를 `--post-update-verify` 비거래 모드로 실행해 DB migration/`PRAGMA quick_check`/필수 테이블 확인.
+- 실패 시 기존 EXE와 업데이트 직전 DB/WAL/SHM snapshot 복구.
+- rollback된 이전 버전의 자동매매 자동재개 금지.
 
-## 3. 절대 변경하면 안 되는 안전 원칙
+### V4.0.2
 
-아래 원칙은 전략 파라미터가 아니라 시스템 안전장치입니다. 사용자가 명시적으로 다른 동작을 요구하지 않는 한 유지합니다.
+- authenticated Private WebSocket `myOrder` + `myAsset` 한 연결 추가.
+- 매 연결 fresh JWT, 장시간 무이벤트 ping/reconnect, credential redaction.
+- `junhyunbank-` identifier 이벤트만 REST reconciliation을 즉시 깨움.
+- Private WS 장애 시 기존 REST fallback 유지.
+- 반복 REST pending 조회에 exponential backoff.
+- `myAsset`으로 managed quantity를 추정하지 않음.
 
-- **출금 API를 구현하지 않는다.**
-- Access Key / Secret Key를 GitHub, SQLite, 로그에 저장하지 않는다.
-- API Key는 OS 자격증명 저장소(`keyring`)에 보관한다.
-- 기존 사용자 보유자산과 JunhyunBank 자동매매 포지션을 구분한다.
-- 자동매도는 JunhyunBank가 직접 연 **관리 수량(managed quantity)** 에만 적용한다.
-- 실시간 trade/orderbook 데이터가 오래되면 신규매수하지 않는다.
-- 반복 API 오류 시 신규매수를 차단한다.
-- 거래소 최소 주문금액을 지킨다.
-- Upbit API Rate Limit은 거래전략상의 한도가 아니라 반드시 지켜야 할 운영 제약이다.
-- 주문 요청 직전에 RUNNING / emergency 상태를 다시 검사해 종료 또는 긴급정지와 경쟁조건이 생겨도 신규매수가 나가지 않게 한다.
-- 주문마다 고유 `identifier`를 사용한다.
-- 긴급정지는 강제청산 버튼이 아니다.
-- 업데이트 중 관리 포지션 DB를 삭제하거나 API Key를 초기화하지 않는다.
+### V4.0.3
 
----
-
-## 4. 버전 역사
-
-### V1
-
-초기 MVP. PAPER/LIVE 모드, 5분봉 이동평균 + RSI 전략, 고정 주문금액/손절/익절/세션 손실제한, ticker WebSocket, 기본 UI와 SQLite 관리상태를 제공했습니다.
-
-V1 Release는 GitHub `V1` 태그로 발행되었습니다.
-
-### V2
-
-V1 전략과 실행구조를 크게 개편한 현재 버전입니다.
-
-- 버전: `2.0.0`
-- Release tag: `V2`
-- main 병합 commit: `12b7e50148e9e4567603d3928fc16c8c4d984787`
-- V2 PR: `#2` — `V2: LIVE MicroFlow 전략·자동 업데이트·UI 개선`
-- Release: `https://github.com/Propeex/JunhyunBank/releases/tag/V2`
-- Windows asset: `JunhyunBank.exe`
-- V2 asset SHA-256: `10d2e5fdcccb92a2332685e70db6a7b69ec6cd76f1dc03b5bccb93b894645121`
-
-V2 주요 변경:
-
-- PAPER 제거, LIVE 전용
-- JH-MicroFlow 실시간 단타 전략
-- 전체 KRW `trade` WebSocket 감시
-- Hot 후보만 `orderbook` 정밀 분석
-- 상대 percentile 기반 Activity/Aggression/Book/Momentum
-- IGNITION / PULLBACK 진입
-- 실제 계정 수수료 + spread + 호가 slippage 비용 필터
-- 고정 주문금액/횟수/포지션 수/익절/손절 제거
-- 동적 자금배분
-- Adaptive Trailing / Emergency Stop / 기대시간 실패 청산
-- Strategy Health Governor
-- DRAINING 종료
-- KRW 보유자산 표시 및 UI 재배치
-- GitHub Release 자동 업데이트 + SHA-256 검증 + rollback
-- V1 SQLite schema 자동 확장
-
----
+- 실거래 threshold를 건드리지 않는 read-only forward-edge validator 추가.
+- Public trade/orderbook으로 실제 `MicroFlowStrategy` 워밍업.
+- 후보 시점 entry ask → horizon 후 future bid 기준, 양쪽 가정 수수료 포함 net return label.
+- label 지연창을 넘긴 호가는 `missed` 처리해 잘못된 horizon 가격 사용 금지.
+- stale 3초 gate 및 deep 재진입 orderbook reset을 live runtime과 맞춤.
+- BUY/전체 후보 분리, ExpectedMove calibration, label completion 측정.
+- 시간순 holdout에서 forward horizon과 겹치는 training label purge.
+- **아직 depth slippage/실제 주문 latency를 포함한 완전한 OOS 수익성 검증은 아님.**
 
 ## 5. 현재 소스 구조
 
-핵심 모듈은 `src/junhyunbank/` 아래에 있습니다.
+핵심은 `src/junhyunbank/`다.
 
 | 파일 | 역할 |
 |---|---|
-| `main.py` | 프로그램 시작, API Key 확인, `--resume-trading` 처리 |
-| `ui.py` | PySide6 UI, 시작/종료/긴급정지/업데이트 |
-| `engine.py` | 시장 감시, 포트폴리오, 전략 호출, 주문 실행, DRAINING |
-| `strategy.py` | JH-MicroFlow 실시간 신호 계산 및 진입/청산 판단 |
-| `health.py` | 최근 실전 성과 기반 Strategy Health 0~1 계산 |
-| `market_stream.py` | Upbit public WebSocket trade/orderbook 수신 |
-| `upbit.py` | REST/JWT 인증, 계좌/주문/주문조회, private rate guard |
-| `risk.py` | 고정 투자한도가 아닌 시스템 안전조건 검사 |
-| `storage.py` | SQLite 이벤트/거래/관리 포지션/전략결과 저장 |
-| `security.py` | OS keyring API Key 저장 |
-| `updater.py` | GitHub latest Release 확인, digest 검증, EXE 교체/restart |
+| `main.py` | 앱 시작, single instance, update verification/resume 처리 |
+| `ui.py` | PySide6 UI, 시작/종료/긴급정지/업데이트/진단 표시 |
+| `engine.py` | 기본 거래 lifecycle, 시장/포트폴리오 평가, 주문 호출 |
+| `runtime_engine.py` | V3/V4 runtime hardening, market discovery, deep stream 재사용, Private stream lifecycle |
+| `execution.py` | durable order intent, 주문 제출, identifier reconciliation, 체결 적용 |
+| `strategy.py` | JH-MicroFlow 특징, HotScore, entry/exit 판단 |
+| `health.py` | 실제 strategy outcomes 기반 Strategy Health |
+| `risk.py` | stale/API/emergency/min-order 시스템 안전조건 |
+| `storage.py` | SQLite events/trades/managed positions/order intents/outcomes |
+| `market_stream.py` | Public trade/orderbook WebSocket |
+| `private_stream.py` | authenticated `myOrder`/`myAsset` WebSocket |
+| `upbit.py` | Public/private REST, JWT, order API, rate guard |
+| `updater.py` | Release 확인, digest, staged update, verify/rollback |
+| `security.py` | OS keyring |
+| `validation.py` | forward label/통계/purged chronological split |
 | `config.py` | SafetyConfig / StrategyConfig |
-| `models.py` | Signal, EngineState, Position 등 데이터 구조 |
 
-테스트는 `tests/`에 있고 GitHub Actions가 PR과 main에서 `pytest`를 실행합니다.
+연구/검증 스크립트:
 
----
+- `scripts/smoke_upbit_public_ws.py`: 주문 없는 Public REST/WS smoke.
+- `scripts/diagnose_public.py`: 주문 없는 기존 전략 대기 이유 관측.
+- `scripts/smoke_private_ws.py`: 로컬 API Key가 있는 환경에서 주문 없이 private subscription 확인용. CI secret을 요구하지 않는다.
+- `scripts/validate_public_edge.py`: V4.0.3 forward-edge shadow dataset 생성. API Key를 읽지 않는다.
 
-## 6. 런타임 상태기계
+## 6. JH-MicroFlow 현재 전략
 
-### EngineState.STOPPED
+전략은 각 코인의 절대 수치가 아니라 자기 최근 상태 대비 상대적 이상현상을 사용한다.
 
-자동매매 정지 상태.
+- 1초 trade frame.
+- Activity: rolling 체결대금 percentile.
+- Aggression: BID/ASK 체결대금 불균형의 rolling percentile.
+- Book: orderbook imbalance, microprice bias, imbalance 변화 percentile.
+- Momentum: short/long return percentile.
+- Quality: 네 factor의 geometric mean.
+- HotScore: deep 분석 후보를 고르는 스캐너 점수이며 **실제 진입 Q와 다름**.
+- IGNITION / PULLBACK 분류.
+- 비용 gate: 실제 계정 bid/ask fee + spread + 호가 기반 예상 slippage.
+- 자금배분: edge × quality × health × regime factor에 실제 호가 capacity를 추가 적용.
+- 청산: 수급 약화, adaptive trailing, entry 시 고정한 emergency risk, 기대시간 실패.
 
-### EngineState.RUNNING
+현재 가장 중요한 전략 한계는 `ExpectedMove`다.
 
-시장 감시, 신규진입, 포지션 청산 모두 허용.
+```text
+ExpectedMove ≈ 최근 |30초 수익률| 분포의 70% quantile
+```
 
-### EngineState.DRAINING
+이는 **조건부 미래 상승 기대수익이 아니라 최근 절대 변동폭 proxy**다. 따라서 복잡한 Kelly/ML 모델을 붙이기 전에 실제 forward label과 replay 데이터를 먼저 확보해야 한다.
 
-사용자가 일반 `종료`를 눌렀을 때 진입.
+## 7. 이미 해결된 과거 결함을 다시 구현하지 말 것
 
-- 즉시 신규매수 금지
-- 이미 관리 중인 포지션은 MicroFlow 청산 규칙을 계속 적용
-- `managed_positions`가 비면 `drain_complete` 이벤트 발생 후 엔진 종료
+- Public WS `Origin` 문제와 연결 재시도.
+- deep 후보 변경마다 socket을 새로 여는 churn: live runtime은 기존 socket subscription을 갱신한다.
+- 신규 deep 종목 stale book history 재사용.
+- `market_event` 문자열 `"false"`를 truthy로 오판하는 문제.
+- `Trade WS 0/0` 상태의 조용한 실패.
+- timeout 주문 재전송/부분체결 추정/전체 계정수량 managed 처리.
+- updater가 새 EXE health 확인 없이 `.old`를 삭제하던 문제.
+- Private account 이벤트 미사용.
 
-### Emergency
+관련 회귀테스트를 삭제하거나 단순화하지 않는다.
 
-`RiskManager.emergency = True` + hard stop.
+## 8. 검증 수준
 
-- 전략 및 신규주문 즉시 중단
-- 기존 포지션 강제청산하지 않음
+### 코드/배포
 
-### Update shutdown
+PR과 `main`에서 Windows + Ubuntu pytest를 실행하고, 실제 Upbit Public REST/WebSocket read-only smoke를 수행한다. `main` release workflow는 Windows EXE를 빌드한 뒤 package version에 맞는 `V4.0.x` Release를 만든다.
 
-업데이트는 일반 DRAINING이 아닙니다.
+### 실거래 안전성
 
-- 관리 포지션을 SQLite에 그대로 유지
-- 엔진을 일시 hard stop
-- 새 EXE로 교체
-- 업데이트 직전 거래 중이었다면 `--resume-trading`으로 재실행
-- 재실행 후 저장된 API Key와 managed position을 사용해 관리 재개
+합성/mocked 거래소에서 timeout, 5xx, 429, partial IOC, nonterminal order, restart recovery, manual holdings 보호, private event wake-up 등을 회귀검증한다. 실제 자금을 사용하는 자동 CI 주문은 하지 않는다.
 
----
+### 전략 수익성
 
-## 7. JH-MicroFlow 전략의 제품 의도
+아직 완료되지 않았다. V4.0.3은 첫 forward-edge 계측 기반일 뿐이다. 한두 번의 BUY 또는 짧은 세션을 근거로 수익성을 선언하거나 threshold를 변경하지 않는다.
 
-전략의 핵심 철학은 다음과 같습니다.
+## 9. 다음 개발 우선순위
 
-> 사람이 모든 코인을 24시간 동시에 보고 호가/체결 변화를 수초 단위로 계산하는 것은 어렵지만 프로그램은 가능하다. 따라서 장기 예측보다 **실시간 수급 변화가 시작되는 짧은 구간**을 찾아 비용을 넘을 가능성이 있는 움직임만 거래한다.
+### P0 — 유지/회귀 방어
 
-중요한 원칙:
+현재 durable 주문/managed quantity/updater/private reconciliation 불변조건을 모든 후속 PR에서 보존한다. 새 기능이 이 경로를 침범하면 작은 PR로 분리하고 failure/restart 테스트를 먼저 작성한다.
 
-- 단순 상승률 상위 종목 추격매수 금지
-- RSI 하나, 이동평균 하나, OFI 하나만으로 매수하지 않음
-- 각 코인을 절대값이 아니라 **자기 자신의 최근 평소 상태 대비 상대적 이상현상**으로 비교
-- 거래량 증가 + 공격적 매수체결 + 호가상승 압력 + 가격 모멘텀이 동시에 살아 있어야 함
-- 좋은 신호라도 수수료/spread/slippage를 넘을 기대 움직임이 없으면 매수하지 않음
-- 산 뒤에는 고정 +N% 익절을 기다리는 것이 아니라 **왜 샀는지의 근거가 유지되는지** 계속 검사
+### P1 — 다음 실제 작업
 
-상세 전략은 `STRATEGY_JH_MICROFLOW.md`를 참조합니다.
+1. **Raw Market Data Recorder**
+   - 전체/선별 trade event, L2 snapshot, exchange timestamp, local receive timestamp 저장.
+   - 파일 회전, 압축, 용량 상한, crash-safe write.
+   - 실거래 엔진을 지연시키지 않도록 bounded queue/drop diagnostics 필요.
+2. **Deterministic Replay Engine**
+   - recorder 데이터를 동일 시간순으로 `MicroFlowStrategy`에 재생.
+   - wall-clock과 monotonic 의존을 injectable clock으로 분리.
+   - 동일 입력 → 동일 특징/decision을 보장하는 regression fixture.
+3. **Purged Walk-forward / Stress Harness**
+   - TRAIN → VALIDATE → OOS 시간순 분리.
+   - fee 1.0/1.25/1.5×, delay +100/+250/+500ms, slippage 악화.
+   - 특정 코인/최고 수익일 제거 sensitivity.
+4. **Conditional ExpectedMove 후보 모델**
+   - 충분한 데이터 이후에만 구현.
+   - 현재 proxy와 새 estimator를 같은 OOS 구간에서 비교.
+5. **Uncertainty-aware sizing / correlation control**
+   - bootstrap lower bound 또는 damped Kelly류는 4의 OOS edge가 확인된 뒤 진행.
+   - 임의 고정 KRW cap을 대체하는 데이터 기반 risk budget이어야 함.
 
----
+### 별도 운영 검증
 
-## 8. 중요한 설계 논의와 실제 V2 구현의 차이
+Private authenticated WebSocket은 CI에 실계정 secret을 넣지 않는다. 실제 설치 환경에서 **주문 없이** 연결/구독만 확인할 수 있으나, API Key 권한과 IP 등록 상태는 사용자 환경에 의존한다.
 
-**매우 중요:** 과거 전략 설계 과정에서 논의한 모든 아이디어가 V2에 구현된 것은 아닙니다. 아래를 혼동하지 마세요.
+## 10. V4.0.3 validator 해석 규칙
 
-### 실제 V2에 구현됨
+실행 예:
 
-- 초 단위 trade frame
-- 체결 없는 초를 0거래/보합 프레임으로 채워 실제 wall-clock 시간창 유지
-- 오래 거래가 없는 종목의 오래된 baseline 제거
-- Activity percentile
-- Aggression(BID vs ASK 체결대금) percentile
-- Orderbook imbalance / microprice bias / imbalance 변화 percentile
-- Momentum percentile
-- 4개 factor의 geometric mean = quality
-- HotScore
-- Market regime: PANIC / RISK_OFF / NEUTRAL / RISK_ON / EUPHORIA
-- IGNITION / PULLBACK 분류
-- expected move = 최근 30초 절대수익 분포의 70% quantile 계열
-- 실제 수수료 조회
-- spread 및 orderbook 기반 slippage simulation
-- 동적 capital fraction
-- Strategy Health multiplier
-- Adaptive trailing
-- 진입 시 emergency risk 저장 후 불리한 방향으로 확대하지 않음
-- signal reset 후 재진입
-
-### 설계에는 있었지만 V2에 완전히 구현되지 않음
-
-1. **Bootstrap Damped Kelly**
-   - 설계상 유사 신호의 승률/손익분포를 bootstrap해 Kelly 하단값으로 자금배분하려 했음.
-   - 현재 V2는 `edge × quality × health × regime_factor`의 단순 곱으로 `capital_fraction`을 계산함.
-
-2. **Correlation Penalty / 포트폴리오 중복위험**
-   - 여러 알트가 사실상 동일 BTC 베타일 때 중복 노출을 줄이려는 설계였음.
-   - 현재 V2에는 명시적 상관관계 패널티가 없음.
-
-3. **Shadow/Virtual Trading 기반 Health 자동 복귀**
-   - 설계상 StrategyHealth=0일 때 실제 매수는 멈추되 가상 체결을 계속 기록해 회복 여부를 판단하려 했음.
-   - 현재 V2는 health가 0이면 신규진입이 정지되며 별도 shadow outcome을 생성하지 않음. 포지션도 없다면 자동 회복 경로가 사실상 부족함. **우선 개선 대상.**
-
-4. **장기 L2 orderbook recorder + replay backtester**
-   - 전략의 진짜 수익성 검증에 필요하지만 아직 구현되지 않음.
-
-5. **Private WebSocket `myOrder` / `myAsset` 중심 주문상태 머신**
-   - 현재는 주문 제출 후 REST `GET /v1/order` polling으로 체결을 확인함.
-   - production hardening 대상.
-
-6. **엄밀한 OFI(Order Flow Imbalance)**
-   - 현재 Book factor는 weighted depth imbalance, microprice bias, imbalance 변화로 구성됨.
-   - 학술적/이벤트 레벨 OFI를 완전히 재현하지는 않음.
-
-따라서 다음 버전에서 “설계대로 이미 되어 있을 것”이라고 가정하지 말고 코드 상태를 확인합니다.
-
----
-
-## 9. 주문 실행 의도
-
-### 진입
-
-일반 진입은 Upbit `best + IOC` 사용.
-
-- 매수: KRW 주문총액(`price`)
-- 매도: 코인 수량(`volume`)
-- 잔량은 IOC 특성상 취소
-- accepted order의 uuid를 이용해 REST 주문상태 확인
-- 실제 체결량/평균체결가를 기록
-
-시장가 매수는 V2 일반 진입에서 기본 방식이 아닙니다.
-
-### 청산
-
-일반 청산도 `best + IOC` 우선.
-
-Emergency Stop 청산에서 IOC가 전혀 체결되지 않으면 시장가 매도를 fallback으로 허용합니다.
-
-### 관리수량
-
-매수 체결 후 실제 executed volume을 `managed_quantity`에 저장합니다.
-
-사용자 계정에 같은 코인의 별도 보유분이 있어도 JunhyunBank가 매도하려는 수량은 관리수량을 넘지 않아야 합니다.
-
----
-
-## 10. API Key와 업데이트 의도
-
-`security.py`의 keyring 저장은 실행파일과 분리되어 있습니다. 따라서 `JunhyunBank.exe`를 교체해도 API Key는 유지됩니다.
-
-업데이트 흐름:
-
-1. GitHub `releases/latest` 조회
-2. `JunhyunBank.exe` asset 탐색
-3. asset의 GitHub `digest`가 `sha256:<hash>`인지 확인
-4. `~/.junhyunbank/update/JunhyunBank.new.exe`로 다운로드
-5. SHA-256 일치 확인
-6. 별도 PowerShell updater 실행
-7. 부모 프로세스 종료 대기
-8. 기존 EXE를 `.old`로 이동
-9. 새 EXE 교체
-10. 교체 실패 시 가능한 경우 `.old` 복구
-11. 성공 시 새 EXE 실행
-12. 거래 중 업데이트였으면 `--resume-trading`
-13. `.old` 삭제
-
-자동 업데이트는 PyInstaller Windows frozen executable에서만 동작하도록 제한되어 있습니다.
-
----
-
-## 11. SQLite 영속 상태
-
-기본 경로: `~/.junhyunbank/junhyunbank.db`
-
-핵심 테이블:
-
-- `events`
-- `trades`
-- `managed_positions`
-- `strategy_outcomes`
-
-V2의 `managed_positions`에는 최소 다음 상태가 추가됩니다.
-
-- `entry_price`
-- `entry_amount_krw`
-- `entry_fee_rate`
-- `initial_risk_pct`
-- `entry_score`
-- `signal_kind`
-- `peak_price`
-- `expected_horizon_seconds`
-- `managed_quantity`
-
-V1 DB를 발견하면 컬럼을 `ALTER TABLE`로 추가해 마이그레이션합니다.
-
-주의: V1에는 managed quantity가 없었기 때문에 V1 관리표시를 V2가 복구할 때 현재 계정의 해당 종목 전체 수량을 관리수량으로 간주하는 fallback이 있습니다. 사용자가 V1 이후 같은 코인을 별도로 추가 매수했다면 이 migration 방식은 완벽하지 않을 수 있습니다. 향후 migration/reconciliation 기능을 개선해야 합니다.
-
----
-
-## 12. 현재 검증 완료 상태
-
-V2 PR과 main에서 GitHub Actions pytest가 통과했고, Windows release workflow에서도 다음 단계가 모두 성공했습니다.
-
-- Python 설치
-- package install
-- pytest
-- PyInstaller one-file Windows build
-- V2 tag resolve
-- GitHub Release 생성
-- `JunhyunBank.exe` asset upload
-
-그러나 이것은 **코드/패키징 검증**이지 전략 수익성 검증이 아닙니다.
-
-실제 기대수익, MDD, slippage 내성, regime별 성능 등은 아직 충분한 실시간 L2 데이터셋이 없어 검증되었다고 말하면 안 됩니다.
-
----
-
-## 13. 현재 알려진 중요 리스크 / 다음 개발 우선순위
-
-상세 내용은 `VALIDATION_AND_ROADMAP.md`를 참조하되, 새 개발자가 가장 먼저 알아야 할 순서는 다음과 같습니다.
-
-### P0/P1 수준으로 우선 검토
-
-1. **실제 Upbit 계정에서 소액 주문 전 end-to-end 체결 상태 머신 검증**
-2. Partial fill / IOC / REST polling timeout / network ambiguity에 대한 reconciliation 강화
-3. Private `myOrder` / `myAsset` WebSocket 도입 검토
-4. Strategy Health가 0이 된 뒤 shadow simulation 없이 영구정지될 가능성 해결
-5. 실시간 trade + orderbook raw recorder와 replay/backtest 엔진 구현
-6. 주문금액 동적 계산이 너무 공격적으로 계좌 대부분을 한 신호에 배분할 수 있는지 검증
-7. 다중 포지션 간 correlation / shared market risk 반영
-8. V1→V2 managed quantity migration의 사용자 보유분 혼합 위험 개선
-
-### P2
-
-- UI chart 종목 선택
-- strategy decision/expected cost/entry reason 상세 표시
-- 거래 리포트 및 분석 화면
-- parameter versioning
-- 진단 export 기능
-
----
-
-## 14. 개발 및 릴리즈 규칙
-
-권장 작업 흐름:
-
-1. `main` 최신 상태 확인
-2. 새 버전용 개발 branch 생성 (예: `v3-development`)
-3. Upbit API 변경을 다루면 공식 문서 최신 사양 재확인
-4. 코드 + 테스트 + 관련 문서 동시에 수정
-5. PR 생성
-6. CI 통과
-7. 코드 diff 및 실거래 edge-case 검토
-8. `main` 병합
-9. 메이저 버전 완성 시 `__version__`/`pyproject.toml`을 `3.0.0`, `4.0.0` 등으로 올림
-10. `main` push 시 release workflow가 `V<major>` 생성
-11. Windows Release asset과 digest 확인
-
-현재 release workflow는 해당 메이저 태그가 이미 존재하면 release 생성을 skip합니다. 같은 `2.x.x`에서 EXE만 다시 만들고 V2 asset을 자동 교체하는 구조가 아니므로, 배포 정책을 바꿀 경우 workflow부터 수정해야 합니다.
-
----
-
-## 15. 다음 ChatGPT/개발자에게 주는 시작 지침
-
-대화 내용이 없고 이 저장소만 받았다면 다음 순서로 시작하세요.
-
-1. 이 문서를 끝까지 읽는다.
-2. `ARCHITECTURE.md`와 `STRATEGY_JH_MICROFLOW.md`를 읽는다.
-3. `VALIDATION_AND_ROADMAP.md`의 P0/P1을 확인한다.
-4. 반드시 현재 `main`의 `engine.py`, `strategy.py`, `upbit.py`, `storage.py`, `updater.py`를 실제로 읽어 문서와 차이가 없는지 확인한다.
-5. 사용자의 새 요구사항이 기존 안전 원칙과 충돌하는지 먼저 판단한다.
-6. 전략 변경 시 “수익 보장”을 주장하지 않는다. 테스트 통과와 수익성 검증을 분리한다.
-7. 완성된 새 메이저 버전은 반드시 V3, V4 식으로 GitHub Release까지 확인한다.
-8. 개발 후 이 문서를 최신 상태로 갱신한다.
-
-이 문서의 목적은 단순 설명이 아니라 **프로젝트의 설계 기억을 GitHub에 보존하는 것**입니다.
+```bash
+python scripts/validate_public_edge.py \
+  --seconds 1800 \
+  --horizons 30,60,120,300 \
+  --sample-every 10 \
+  --output edge-validation.json
+```
+
+반드시 확인할 필드:
+
+- `run.orders_submitted == 0`
+- `run.websocket_errors`
+- horizon별 `label_completion_rate` / `missed_label_count`
+- `buy_sample_count`
+- `buy.mean_net_return`, `buy.positive_net_rate`
+- `train_buy`와 `holdout_buy` 차이
+- `purged_from_train_count`
+- ExpectedMove coverage/correlation/observed-to-expected ratio
+
+표본이 적거나 label completion이 낮으면 성과 해석보다 수집 품질을 먼저 해결한다.
+
+## 11. 후속 개발자가 하지 말아야 할 것
+
+- 거래가 적다는 이유만으로 `ignition_quality`, `pullback_quality`, 비용 배수를 바로 낮추지 않는다.
+- `ExpectedMove`를 이미 검증된 미래수익 예측값처럼 사용하지 않는다.
+- backtest 전체기간 하나에서 threshold를 최적화한 뒤 같은 기간 성과를 OOS라고 부르지 않는다.
+- random shuffle로 시장시계열 train/test를 나누지 않는다.
+- Private WS 이벤트만 보고 체결 회계를 확정하지 않는다.
+- 계정 balance 변화만으로 JunhyunBank managed quantity를 재구성하지 않는다.
+- pending order를 자동 삭제하거나 같은 주문을 재제출하지 않는다.
+- 회귀테스트/공개 smoke가 실패한 상태에서 merge/release하지 않는다.
+
+## 12. 완료 정의
+
+후속 PR의 완료는 코드 작성으로 끝나지 않는다.
+
+- 관련 unit/regression test 통과.
+- Windows + Ubuntu CI 통과.
+- 실제 Public REST/WebSocket smoke 통과.
+- 거래 경로 변경이라면 restart/ambiguous response/partial fill/managed quantity 회귀검증.
+- 문서와 CHANGELOG 동시 갱신.
+- `main` 병합 후 Windows Release workflow와 실제 `JunhyunBank.exe` asset 생성 확인.
+
+전략 개선은 여기에 더해 충분한 recorder 데이터, purged OOS, 비용/지연/slippage stress를 통과해야 한다.

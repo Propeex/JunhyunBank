@@ -14,8 +14,9 @@
 6. [`V4_AUDIT.md`](V4_AUDIT.md) — V4 런타임·매수 경로·주문 복구 감사와 남은 과제
 7. [`V4_0_1_UPDATE_RECOVERY.md`](V4_0_1_UPDATE_RECOVERY.md) — 새 EXE 사전검증, DB snapshot, 실패 시 EXE+DB 원자 롤백
 8. [`V4_0_2_PRIVATE_RECONCILIATION.md`](V4_0_2_PRIVATE_RECONCILIATION.md) — authenticated myOrder/myAsset 보조 감시, event-driven REST reconciliation, 잔고 보호 불변조건
-9. [`V3_RUNTIME_HARDENING.md`](V3_RUNTIME_HARDENING.md) — V3 Public WebSocket 안정화와 런타임 진단
-10. [`V3_0_1_MARKET_DISCOVERY_FIX.md`](V3_0_1_MARKET_DISCOVERY_FIX.md) — `Trade WS 0/0` / KRW 유니버스 0개 증상, 원인 경로, V3.0.1 보완과 검증 기준
+9. [`V4_0_3_EDGE_VALIDATION.md`](V4_0_3_EDGE_VALIDATION.md) — 주문 없는 public forward-edge 수집, label 품질, purged chronological holdout
+10. [`V3_RUNTIME_HARDENING.md`](V3_RUNTIME_HARDENING.md) — V3 Public WebSocket 안정화와 런타임 진단
+11. [`V3_0_1_MARKET_DISCOVERY_FIX.md`](V3_0_1_MARKET_DISCOVERY_FIX.md) — `Trade WS 0/0` / KRW 유니버스 0개 증상, 원인 경로, V3.0.1 보완과 검증 기준
 
 ## 문서 유지 규칙
 
@@ -27,4 +28,4 @@
 - Upbit API 사용 변경 → `UPBIT_INTEGRATION.md`
 - 런타임 데이터/배포 안정화 → 해당 버전의 runtime/fix 문서 및 `CHANGELOG.md`
 
-사용자가 보는 제품 이름은 **V1, V2, V3 ... 메이저 버전**을 유지하되, 같은 메이저의 수정 배포는 `V4.0.2`처럼 semantic patch tag를 사용할 수 있습니다. 이는 업데이트 버튼이 기존 설치본과 새 패치 배포를 구분할 수 있게 하기 위한 것입니다.
+사용자가 보는 제품 이름은 **V1, V2, V3 ... 메이저 버전**을 유지하되, 같은 메이저의 수정 배포는 `V4.0.3`처럼 semantic patch tag를 사용할 수 있습니다. 이는 업데이트 버튼이 기존 설치본과 새 패치 배포를 구분할 수 있게 하기 위한 것입니다.
