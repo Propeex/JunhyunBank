@@ -119,7 +119,20 @@ class TradingEngine(BaseTradingEngine):
         return flagged or not understood
 
     def _refresh_markets(self) -> None:
-        rows = self.client.get_markets()
+        # Base V2 calls market refresh on every loop while the universe is empty.
+        # Back off failed discovery attempts here so an upstream/schema problem
+        # cannot turn into a self-inflicted public REST rate-limit storm.
+        now = time.monotonic()
+        retry_at = float(getattr(self, "_market_discovery_retry_at", 0.0))
+        if not self._allowed_markets and now < retry_at:
+            return
+
+        try:
+            rows = self.client.get_markets()
+        except Exception:
+            self._market_discovery_retry_at = now + 10.0
+            raise
+
         raw_krw: list[str] = []
         allowed: list[str] = []
         flagged_count = 0
@@ -148,6 +161,7 @@ class TradingEngine(BaseTradingEngine):
         allowed = sorted(dict.fromkeys(allowed))
 
         if not raw_krw:
+            self._market_discovery_retry_at = now + 10.0
             sample_codes = [
                 str(row.get("market") or "")
                 for row in rows[:5]
@@ -159,6 +173,7 @@ class TradingEngine(BaseTradingEngine):
             )
 
         if not allowed:
+            self._market_discovery_retry_at = now + 10.0
             raise RuntimeError(
                 "KRW 마켓은 수신했지만 안전하게 해석 가능한 종목이 0개입니다. "
                 f"KRW={len(raw_krw)}, 경보제외={flagged_count}, "
@@ -166,6 +181,7 @@ class TradingEngine(BaseTradingEngine):
                 "자동매매는 안전을 위해 시작하지 않습니다."
             )
 
+        self._market_discovery_retry_at = 0.0
         if allowed == self._allowed_markets:
             return
 
