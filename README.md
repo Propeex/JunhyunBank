@@ -1,4 +1,12 @@
-# JunhyunBank V4.0.3
+# JunhyunBank V4.0.4
+
+## V4.0.4 — Raw market data recorder
+
+V4.0.4는 전략을 더 수정하기 전에 같은 실제 시장경로를 반복 재생할 수 있도록 **비차단 raw trade/L2 recorder**를 추가합니다. `scripts/record_public_market.py`는 API Key를 읽지 않고 Public REST/WebSocket만 사용하며 주문 API를 호출하지 않습니다.
+
+전체 안전 KRW 시장의 trade와 현재 Hot 후보의 기본 15레벨 orderbook을 기록합니다. WebSocket callback은 bounded queue에 비차단 enqueue만 하고 파일 기록·fsync·rotation·gzip은 background thread에서 처리합니다. queue가 포화되면 실시간 시세 처리를 늦추지 않고 recorder event를 drop한 뒤 종료 상태와 통계에 명시합니다. 활성 `.jsonl.part`는 fsync 후 원자적으로 finalize하며, 비정상 종료 시 마지막 완전한 줄까지 복구합니다.
+
+상세 데이터 형식과 복구/보존 정책: **[V4.0.4 Raw Market Data Recorder](docs/V4_0_4_MARKET_RECORDER.md)**.
 
 ## V4.0.3 — Read-only forward-edge 검증 기반
 
@@ -52,6 +60,7 @@ V4.0.1은 거래 전략을 바꾸지 않는 배포 안정화 패치입니다. �
 - [`docs/V4_0_1_UPDATE_RECOVERY.md`](docs/V4_0_1_UPDATE_RECOVERY.md) — 업데이트 health handshake와 EXE+DB rollback
 - [`docs/V4_0_2_PRIVATE_RECONCILIATION.md`](docs/V4_0_2_PRIVATE_RECONCILIATION.md) — authenticated private stream과 event-driven REST reconciliation
 - [`docs/V4_0_3_EDGE_VALIDATION.md`](docs/V4_0_3_EDGE_VALIDATION.md) — 주문 없는 public forward-edge 수집과 purged chronological holdout
+- [`docs/V4_0_4_MARKET_RECORDER.md`](docs/V4_0_4_MARKET_RECORDER.md) — 비차단 raw trade/L2 recorder와 crash-safe rotation/retention
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 런타임/모듈/주문/업데이트 구조
 - [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md) — 전략 의도, 수식, 실제 구현과 미구현 설계
 - [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 리스크, P0/P1/P2 로드맵
@@ -127,7 +136,7 @@ API Key는 실행파일 내부가 아니라 운영체제 keyring에 저장되므
 
 전체 KRW 마켓의 `trade` WebSocket을 여러 persistent 연결로 분할해 실시간 수집합니다. 1초 단위 프레임으로 거래대금과 BID/ASK 체결을 집계하고, 상대적으로 뜨거워진 후보에 대해서만 `orderbook`을 구독해 5개 호가쌍의 OBI·Microprice·호가 변화 및 실제 체결 가능 금액을 분석합니다.
 
-V4 런타임은 `runtime_engine.TradingEngine`이 핵심 `engine.TradingEngine`을 상속합니다. V4에서는 이 구조 위에 주문 의도 영속화, 재시작/체결 복구, Private account event 보조 reconciliation이 추가돼 있습니다.
+V4 런타임은 `runtime_engine.TradingEngine`이 핵심 `engine.TradingEngine`을 상속합니다. V4에서는 이 구조 위에 주문 의도 영속화, 재시작/체결 복구, Private account event 보조 reconciliation이 추가돼 있습니다. V4.0.4의 recorder는 이 live runtime과 분리된 Public-only 연구 도구입니다.
 
 주문은 일반 진입/청산에 Upbit `best + IOC`를 사용합니다. Emergency Stop 청산에서 IOC가 명시적으로 종료되고 0체결임이 확인된 경우에만 시장가 매도를 보조 수단으로 사용할 수 있습니다. 거래소 API Rate Limit은 전략상의 거래횟수 제한과 별개로 항상 준수합니다.
 
@@ -146,13 +155,14 @@ python -m pip install -e ".[dev]"
 pytest -q
 python scripts/smoke_upbit_public_ws.py --timeout 20 --attempts 3
 python scripts/validate_public_edge.py --seconds 1800 --output edge-validation.json
+python scripts/record_public_market.py --seconds 3600 --output-dir ~/.junhyunbank/recordings
 python launcher.py
 ```
 
-Public WebSocket smoke test와 forward-edge validator는 실제 Upbit Public REST/WebSocket만 사용하며 **API Key와 주문 API를 사용하지 않습니다.** Private account WebSocket은 CI에 실계정 API Key를 넣지 않으므로 protocol/auth/reconciliation을 mock regression으로 검증하고, 실제 authenticated 연결은 설치 후 운영 로그에서 별도로 확인합니다.
+Public WebSocket smoke test, forward-edge validator, raw market recorder는 실제 Upbit Public REST/WebSocket만 사용하며 **API Key와 주문 API를 사용하지 않습니다.** Private account WebSocket은 CI에 실계정 API Key를 넣지 않으므로 protocol/auth/reconciliation을 mock regression으로 검증하고, 실제 authenticated 연결은 설치 후 운영 로그에서 별도로 확인합니다.
 
-`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public REST/WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.3` 등)를 생성합니다.
+`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public REST/WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.4` 등)를 생성합니다.
 
 ## 전략 검증에 대한 원칙
 
-코드/실서버 연결 테스트 통과는 수익성 검증을 뜻하지 않습니다. V4.0.3은 현재 전략의 forward edge를 주문 없이 측정할 수 있는 첫 기반이며, 아직 depth slippage·실제 주문지연·충분한 장기간 OOS를 포함한 완전한 수익성 검증은 아닙니다. 특히 현재 `ExpectedMove`는 진정한 조건부 미래수익 모델이 아니라 최근 절대 변동폭 proxy입니다.
+코드/실서버 연결 테스트 통과는 수익성 검증을 뜻하지 않습니다. V4.0.3의 forward-edge 계측과 V4.0.4의 raw recorder는 현재 전략을 같은 시장경로에서 반복 검증하기 위한 기반입니다. 아직 deterministic replay, depth slippage·실제 주문지연·충분한 장기간 purged OOS를 포함한 완전한 수익성 검증은 아닙니다. 특히 현재 `ExpectedMove`는 진정한 조건부 미래수익 모델이 아니라 최근 절대 변동폭 proxy입니다.
