@@ -21,8 +21,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
           pip install pyinstaller
-      - name: Test
+      - name: Unit and regression tests
         run: pytest -q
+      - name: Read-only Upbit public WebSocket smoke test
+        run: python scripts/smoke_upbit_public_ws.py --timeout 20 --attempts 3
       - name: Build Windows executable
         run: pyinstaller --clean --noconfirm --onefile --windowed --name JunhyunBank launcher.py
       - name: Resolve release tag
