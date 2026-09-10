@@ -229,7 +229,7 @@ class UpbitClient:
             "price": f"{krw_amount:.0f}",
             "ord_type": "best",
             "time_in_force": "ioc",
-            "identifier": f"junhyunbank-v3-{uuid.uuid4()}",
+            "identifier": f"junhyunbank-v2-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
 
@@ -240,7 +240,7 @@ class UpbitClient:
             "volume": format(volume, ".16g"),
             "ord_type": "best",
             "time_in_force": "ioc",
-            "identifier": f"junhyunbank-v3-{uuid.uuid4()}",
+            "identifier": f"junhyunbank-v2-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
 
@@ -250,7 +250,7 @@ class UpbitClient:
             "side": "bid",
             "price": f"{krw_amount:.0f}",
             "ord_type": "price",
-            "identifier": f"junhyunbank-v3-{uuid.uuid4()}",
+            "identifier": f"junhyunbank-v2-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
 
@@ -260,7 +260,7 @@ class UpbitClient:
             "side": "ask",
             "volume": format(volume, ".16g"),
             "ord_type": "market",
-            "identifier": f"junhyunbank-v3-{uuid.uuid4()}",
+            "identifier": f"junhyunbank-v2-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
 
