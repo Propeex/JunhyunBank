@@ -124,7 +124,9 @@ def test_unknown_alert_shape_fails_closed():
 
 
 def test_refresh_markets_builds_nonzero_krw_streams(monkeypatch, tmp_path):
-    import junhyunbank.runtime_engine as module
+    # _restart_global_streams is inherited from the base engine and resolves
+    # MarketStream in junhyunbank.engine, so patch that module for this test.
+    import junhyunbank.engine as base_module
 
     rows = [
         {"market": "KRW-BTC", "market_event": _normal_event()},
@@ -138,7 +140,7 @@ def test_refresh_markets_builds_nonzero_krw_streams(monkeypatch, tmp_path):
         {"market": "BTC-ETH", "market_event": _normal_event()},
     ]
     _FakeStream.instances.clear()
-    monkeypatch.setattr(module, "MarketStream", _FakeStream)
+    monkeypatch.setattr(base_module, "MarketStream", _FakeStream)
     engine = _engine(tmp_path, _MarketClient(rows))
 
     engine._refresh_markets()
