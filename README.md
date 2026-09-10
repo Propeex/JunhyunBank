@@ -4,6 +4,21 @@
 
 > **주의:** V2는 모의매매 모드가 없습니다. `시작` 버튼은 실제 업비트 계정에서 실제 원화 주문을 실행합니다. API Key에는 출금 권한을 부여하지 마세요.
 
+## 개발자 / 다음 ChatGPT 인수인계
+
+이전 대화가 없어도 개발을 이어갈 수 있도록 제품 의도, 구현 구조, 전략 명세, 검증 상태, 알려진 위험과 다음 우선순위를 GitHub에 영구 문서화했습니다.
+
+**새 개발자 또는 새 ChatGPT 세션은 [`docs/DEVELOPER_HANDOFF.md`](docs/DEVELOPER_HANDOFF.md)부터 읽으세요.**
+
+전체 문서 색인: [`docs/README.md`](docs/README.md)
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 런타임/모듈/주문/업데이트 구조
+- [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md) — 전략 의도, 수식, V2 실제 구현과 미구현 설계
+- [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 리스크, P0/P1/P2 로드맵
+- [`docs/UPBIT_INTEGRATION.md`](docs/UPBIT_INTEGRATION.md) — Upbit 인증/주문/WebSocket/Rate Limit 전제
+
+코드와 문서가 충돌하면 현재 `main` 코드가 최종 사실이며, 기능/전략을 변경할 때 관련 인수인계 문서도 함께 갱신합니다.
+
 ## V2 핵심 변경
 
 - LIVE 전용: PAPER/LIVE 선택 제거
