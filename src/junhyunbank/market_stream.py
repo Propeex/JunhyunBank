@@ -39,8 +39,9 @@ class MarketStream:
         self._last_message = 0.0
         self._connected = False
         self._message_count = 0
-        self._connected_at = 0.0
         self._last_error = ""
+        self._ws: Any | None = None
+        self._ws_lock = threading.RLock()
 
     @property
     def age_seconds(self) -> float:
@@ -69,6 +70,13 @@ class MarketStream:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._ws_lock:
+            ws = self._ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
 
@@ -78,7 +86,7 @@ class MarketStream:
             request.append(
                 {
                     "type": "trade",
-                    "codes": self.markets,
+                    "codes": list(self.markets),
                     "is_only_realtime": True,
                 }
             )
@@ -93,6 +101,37 @@ class MarketStream:
             )
         request.append({"format": "DEFAULT"})
         return request
+
+    def _send_subscription(self) -> bool:
+        with self._ws_lock:
+            ws = self._ws
+            if ws is None or not self._connected:
+                return False
+            try:
+                ws.send(json.dumps(self._subscription()))
+                return True
+            except Exception as exc:
+                self._last_error = str(exc)
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                return False
+
+    def update_markets(self, markets: list[str]) -> bool:
+        """Update a live subscription without reconnecting when possible.
+
+        Upbit supports replacing the active data subscription by sending a new
+        subscription message on the existing WebSocket. If the connection is
+        unavailable, the new market list is retained and used on reconnect.
+        """
+        updated = list(dict.fromkeys(markets))
+        if updated == self.markets:
+            return self._connected
+        self.markets = updated
+        sent = self._send_subscription() if updated else False
+        self._emit_status("subscribed" if sent else "subscription_pending")
+        return sent
 
     def _emit_status(self, state: str, message: str = "") -> None:
         if not self.on_status:
@@ -132,6 +171,15 @@ class MarketStream:
             suppress_origin=True,
         )
 
+    @staticmethod
+    def _server_error(data: dict[str, Any]) -> str | None:
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return None
+        name = str(error.get("name") or "websocket_error")
+        message = str(error.get("message") or "WebSocket 요청에 실패했습니다.")
+        return f"{name}: {message}"
+
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set() and self.markets:
@@ -139,9 +187,11 @@ class MarketStream:
             try:
                 self._emit_status("connecting")
                 ws = self._open_connection()
-                ws.send(json.dumps(self._subscription()))
-                self._connected = True
-                self._connected_at = time.monotonic()
+                with self._ws_lock:
+                    self._ws = ws
+                    self._connected = True
+                if not self._send_subscription():
+                    raise RuntimeError("WebSocket 구독 요청 전송 실패")
                 self._last_error = ""
                 self._emit_status("connected")
                 backoff = 1.0
@@ -151,11 +201,16 @@ class MarketStream:
                     except websocket.WebSocketTimeoutException:
                         ws.ping()
                         continue
+                    if payload in (None, "", b""):
+                        raise RuntimeError("WebSocket 연결이 종료되었습니다.")
                     if isinstance(payload, bytes):
                         payload = payload.decode("utf-8")
                     data = json.loads(payload)
                     if not isinstance(data, dict):
                         continue
+                    server_error = self._server_error(data)
+                    if server_error:
+                        raise RuntimeError(f"Upbit WebSocket {server_error}")
                     self._last_message = time.monotonic()
                     self._message_count += 1
                     message_type = str(data.get("type") or "")
@@ -172,7 +227,10 @@ class MarketStream:
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 15.0)
             finally:
-                self._connected = False
+                with self._ws_lock:
+                    self._connected = False
+                    if self._ws is ws:
+                        self._ws = None
                 if ws is not None:
                     try:
                         ws.close()
