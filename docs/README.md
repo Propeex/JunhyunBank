@@ -11,8 +11,10 @@
 3. [`STRATEGY_JH_MICROFLOW.md`](STRATEGY_JH_MICROFLOW.md) — 전략 철학, 수식, 실제 구현 규칙, 설계상 미구현 기능
 4. [`VALIDATION_AND_ROADMAP.md`](VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 알려진 결함/리스크, 실전 검증 계획, 우선순위
 5. [`UPBIT_INTEGRATION.md`](UPBIT_INTEGRATION.md) — Upbit API 사용법, 주문/인증/Rate Limit/보안 전제
-6. [`V3_RUNTIME_HARDENING.md`](V3_RUNTIME_HARDENING.md) — V3 Public WebSocket 안정화와 런타임 진단
-7. [`V3_0_1_MARKET_DISCOVERY_FIX.md`](V3_0_1_MARKET_DISCOVERY_FIX.md) — `Trade WS 0/0` / KRW 유니버스 0개 증상, 원인 경로, V3.0.1 보완과 검증 기준
+6. [`V4_AUDIT.md`](V4_AUDIT.md) — V4 런타임·매수 경로·주문 복구 감사와 남은 과제
+7. [`V4_0_1_UPDATE_RECOVERY.md`](V4_0_1_UPDATE_RECOVERY.md) — 새 EXE 사전검증, DB snapshot, 실패 시 EXE+DB 원자 롤백
+8. [`V3_RUNTIME_HARDENING.md`](V3_RUNTIME_HARDENING.md) — V3 Public WebSocket 안정화와 런타임 진단
+9. [`V3_0_1_MARKET_DISCOVERY_FIX.md`](V3_0_1_MARKET_DISCOVERY_FIX.md) — `Trade WS 0/0` / KRW 유니버스 0개 증상, 원인 경로, V3.0.1 보완과 검증 기준
 
 ## 문서 유지 규칙
 
@@ -24,4 +26,4 @@
 - Upbit API 사용 변경 → `UPBIT_INTEGRATION.md`
 - 런타임 데이터/배포 안정화 → 해당 버전의 runtime/fix 문서 및 `CHANGELOG.md`
 
-사용자가 보는 제품 이름은 **V1, V2, V3 ... 메이저 버전**을 유지하되, 같은 메이저의 수정 배포는 `V3.0.1`처럼 semantic patch tag를 사용할 수 있습니다. 이는 업데이트 버튼이 기존 V3 설치본과 새 패치 배포를 구분할 수 있게 하기 위한 것입니다.
+사용자가 보는 제품 이름은 **V1, V2, V3 ... 메이저 버전**을 유지하되, 같은 메이저의 수정 배포는 `V4.0.1`처럼 semantic patch tag를 사용할 수 있습니다. 이는 업데이트 버튼이 기존 설치본과 새 패치 배포를 구분할 수 있게 하기 위한 것입니다.

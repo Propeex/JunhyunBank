@@ -1,3 +1,12 @@
+# V4.0.1 — 업데이트 사전검증·원자 롤백
+
+- 새 EXE를 정상 실행하기 전에 `--post-update-verify` 비거래 검증 모드로 현재 DB 스키마와 SQLite 무결성을 확인.
+- 검증 전 현재 EXE와 SQLite DB/WAL/SHM을 snapshot으로 보존.
+- 새 바이너리가 token/version health marker를 만들지 못하면 이전 EXE와 업데이트 직전 DB를 함께 복원.
+- 새 버전 검증이 완료되기 전에는 LIVE 자동매매 자동 재개 금지.
+- rollback으로 복구된 이전 버전은 자동매매를 자동 재개하지 않도록 fail-safe 처리.
+- 상세 설계: [V4.0.1 업데이트 복구](docs/V4_0_1_UPDATE_RECOVERY.md).
+
 # V4.0.0 — 런타임·주문 복구·매수 진단
 
 - 정지 후 재시작 구독 복구 및 일시 네트워크 오류 복구.
