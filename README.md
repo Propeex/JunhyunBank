@@ -1,4 +1,10 @@
-# JunhyunBank V4.0.1
+# JunhyunBank V4.0.2
+
+## V4.0.2 — Private 주문·자산 보조 reconciliation
+
+V4.0.2는 V4의 durable 주문 복구를 authenticated `myOrder`/`myAsset` WebSocket으로 보강합니다. Private 이벤트는 빠른 감지 신호로만 사용하고, 실제 체결량·가격·수수료·terminal 상태는 기존 identifier REST 조회를 정본으로 유지합니다. Private WS 장애가 나도 REST 복구는 계속 동작하며, `myAsset`의 계정 잔고를 JunhyunBank 자동관리 수량으로 추정하지 않습니다.
+
+상세 설계와 검증 범위: **[V4.0.2 Private Reconciliation](docs/V4_0_2_PRIVATE_RECONCILIATION.md)**.
 
 ## V4.0.1 — 업데이트 사전검증과 원자 롤백
 
@@ -14,12 +20,13 @@ V4.0.1은 거래 전략을 바꾸지 않는 배포 안정화 패치입니다. �
 - 5초 수급의 비교 기준을 과거 5초 수급으로 바로잡았습니다.
 - 주문 전에 식별자를 저장해 응답 유실과 재시작 후에도 주문 결과를 조회합니다. 미확정 주문을 중복 제출하지 않습니다.
 - 부분 체결은 실제 체결량·금액으로 기록하며, 관리 수량을 전체 계정 잔고로 추정하지 않습니다.
+- Private `myOrder` 이벤트는 pending identifier의 REST reconciliation을 앞당기며, `myAsset`은 잔고 변동 감지용 보조 신호로만 사용합니다.
 
 상세 원인, 수정 내용, 테스트 및 남은 한계: **[V4 감사 보고서](docs/V4_AUDIT.md)**.
 
 업데이트 후 `시작`을 누르면 약 3분의 기본 워밍업을 거칩니다. 거래가 적은 종목은 더 오래 걸릴 수 있습니다. 높은 HotScore만으로 매수하지 않으며 비용과 진입 품질 조건까지 충족해야 합니다. V4는 매수 횟수를 늘리기 위해 이 조건을 낮추지 않았습니다.
 
-아래 V3 설명은 계승된 기능과 변경 이력입니다. 주문·진단의 최신 동작은 위 V4 보고서를 기준으로 확인하세요.
+아래 V3 설명은 계승된 기능과 변경 이력입니다. 주문·진단의 최신 동작은 위 V4 문서를 기준으로 확인하세요.
 
 업비트 KRW 마켓을 24시간 감시하는 개인용 **LIVE 전용** 자동매매 Windows 데스크톱 프로그램입니다.
 
@@ -35,6 +42,7 @@ V4.0.1은 거래 전략을 바꾸지 않는 배포 안정화 패치입니다. �
 
 - [`docs/V4_AUDIT.md`](docs/V4_AUDIT.md) — V4 런타임·주문·매수 경로 감사와 남은 과제
 - [`docs/V4_0_1_UPDATE_RECOVERY.md`](docs/V4_0_1_UPDATE_RECOVERY.md) — 업데이트 health handshake와 EXE+DB rollback
+- [`docs/V4_0_2_PRIVATE_RECONCILIATION.md`](docs/V4_0_2_PRIVATE_RECONCILIATION.md) — authenticated private stream과 event-driven REST reconciliation
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 런타임/모듈/주문/업데이트 구조
 - [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md) — 전략 의도, 수식, 실제 구현과 미구현 설계
 - [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 리스크, P0/P1/P2 로드맵
@@ -110,7 +118,7 @@ API Key는 실행파일 내부가 아니라 운영체제 keyring에 저장되므
 
 전체 KRW 마켓의 `trade` WebSocket을 여러 persistent 연결로 분할해 실시간 수집합니다. 1초 단위 프레임으로 거래대금과 BID/ASK 체결을 집계하고, 상대적으로 뜨거워진 후보에 대해서만 `orderbook`을 구독해 5개 호가쌍의 OBI·Microprice·호가 변화 및 실제 체결 가능 금액을 분석합니다.
 
-V4 런타임은 `runtime_engine.TradingEngine`이 핵심 `engine.TradingEngine`을 상속합니다. V4에서는 이 구조 위에 주문 의도 영속화와 재시작/체결 복구가 추가돼 있습니다.
+V4 런타임은 `runtime_engine.TradingEngine`이 핵심 `engine.TradingEngine`을 상속합니다. V4에서는 이 구조 위에 주문 의도 영속화, 재시작/체결 복구, Private account event 보조 reconciliation이 추가돼 있습니다.
 
 주문은 일반 진입/청산에 Upbit `best + IOC`를 사용합니다. Emergency Stop 청산에서 IOC가 명시적으로 종료되고 0체결임이 확인된 경우에만 시장가 매도를 보조 수단으로 사용할 수 있습니다. 거래소 API Rate Limit은 전략상의 거래횟수 제한과 별개로 항상 준수합니다.
 
@@ -118,6 +126,7 @@ V4 런타임은 `runtime_engine.TradingEngine`이 핵심 `engine.TradingEngine`�
 
 - Access Key / Secret Key는 GitHub, SQLite, 로그에 저장하지 않습니다.
 - Python `keyring`을 통해 OS 자격증명 저장소를 사용합니다.
+- Private WebSocket JWT는 매 연결마다 새로 만들고 로그에 남기지 않습니다.
 - 출금 API는 구현하지 않습니다.
 - API 오류 반복, 오래된 trade/orderbook 데이터, 최소 주문금액 미달에서는 신규 주문을 차단합니다.
 
@@ -130,9 +139,9 @@ python scripts/smoke_upbit_public_ws.py --timeout 20 --attempts 3
 python launcher.py
 ```
 
-Public WebSocket smoke test는 실제 Upbit 시장 탐색 후 선택한 KRW 페어의 체결과 호가를 받는지를 검증하며 **API Key와 주문 API를 사용하지 않습니다.**
+Public WebSocket smoke test는 실제 Upbit 시장 탐색 후 선택한 KRW 페어의 체결과 호가를 받는지를 검증하며 **API Key와 주문 API를 사용하지 않습니다.** Private account WebSocket은 CI에 실계정 API Key를 넣지 않으므로 protocol/auth/reconciliation을 mock regression으로 검증하고, 실제 authenticated 연결은 설치 후 운영 로그에서 별도로 확인합니다.
 
-`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public REST/WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.1` 등)를 생성합니다.
+`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public REST/WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.2` 등)를 생성합니다.
 
 ## 전략 검증에 대한 원칙
 

@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
 from .engine import TradingEngine as BaseTradingEngine
 from .market_stream import MarketStream
+from .private_stream import PrivateAccountStream
 
 
 class TradingEngine(BaseTradingEngine):
-    """V3 runtime-hardened engine.
+    """Runtime-hardened engine.
 
-    The trading/order/risk implementation remains in the V2 base engine. This
-    layer changes runtime market-data lifecycle and compatibility handling only,
-    so order sizing, entries, exits, and managed-position protection remain in
-    the base engine.
+    The core trading/order/risk implementation remains in the base engine. This
+    layer owns runtime market-data compatibility plus the authenticated account
+    event stream used to accelerate durable order reconciliation. Private
+    WebSocket data is deliberately auxiliary: canonical fills still come from
+    REST ``GET /v1/order`` and account balances are never used to infer managed
+    quantity.
     """
 
     _ALERT_TRUE = {
@@ -36,6 +40,188 @@ class TradingEngine(BaseTradingEngine):
         "none",
         "normal",
     }
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._private_stream: PrivateAccountStream | None = None
+        self._private_reconcile_lock = threading.Lock()
+        self._private_reconcile_requested: set[str] = set()
+        self._order_reconcile_retry_at: dict[str, float] = {}
+        self._order_reconcile_failures: dict[str, int] = {}
+        self._private_status_state = "stopped"
+        self._private_order_events = 0
+        self._private_asset_events = 0
+
+    def start(self) -> None:
+        if self.running:
+            return
+        with self._private_reconcile_lock:
+            self._private_reconcile_requested.clear()
+        self._order_reconcile_retry_at.clear()
+        self._order_reconcile_failures.clear()
+        self._private_order_events = 0
+        self._private_asset_events = 0
+        super().start()
+        self._start_private_account_stream()
+
+    def _start_private_account_stream(self) -> None:
+        # Test/dummy clients intentionally do not expose the package-internal
+        # authorization helper. Real UpbitClient does. Failure to bring up this
+        # auxiliary stream must never stop the REST reconciliation path.
+        authorization = getattr(self.client, "_authorization", None)
+        if not callable(authorization):
+            return
+        stream = PrivateAccountStream(
+            lambda: authorization(None),
+            on_order=self._on_private_order,
+            on_asset=self._on_private_asset,
+            on_error=lambda message: self._emit("warning", message),
+            on_status=self._on_private_status,
+        )
+        self._private_stream = stream
+        stream.start()
+        engine_thread = self._thread
+        if engine_thread is not None:
+            threading.Thread(
+                target=self._watch_private_lifecycle,
+                args=(engine_thread, stream),
+                name="private-account-lifecycle",
+                daemon=True,
+            ).start()
+
+    def _watch_private_lifecycle(
+        self, engine_thread: threading.Thread, stream: PrivateAccountStream
+    ) -> None:
+        engine_thread.join()
+        stream.stop()
+        if self._private_stream is stream:
+            self._private_stream = None
+
+    def _on_private_status(self, payload: dict[str, Any]) -> None:
+        state = str(payload.get("state") or "")
+        previous = self._private_status_state
+        self._private_status_state = state
+        # Surface lifecycle transitions, but don't persist a log every periodic
+        # ping/alive callback during normal private-stream silence.
+        if state == "connected" and previous != "connected":
+            self._emit(
+                "private_account",
+                "Private WS 연결 · myOrder/myAsset 보조 감시 시작",
+                connected=True,
+            )
+        elif state == "stopped" and previous != "stopped":
+            self.events.put(
+                {
+                    "type": "private_account",
+                    "message": "Private WS 종료",
+                    "connected": False,
+                }
+            )
+
+    def _on_private_order(self, event: dict[str, Any]) -> None:
+        self._private_order_events += 1
+        identifier = str(event.get("identifier") or "").strip()
+        state = str(event.get("state") or "").strip().lower()
+        market = str(event.get("code") or "").strip().upper()
+
+        # Ignore manual/third-party orders for state mutation. JunhyunBank order
+        # intents always use this prefix, and only those identifiers can request
+        # an accelerated REST reconciliation.
+        if identifier.startswith("junhyunbank-"):
+            with self._private_reconcile_lock:
+                self._private_reconcile_requested.add(identifier)
+            self.events.put(
+                {
+                    "type": "private_order",
+                    "message": f"{market or '주문'} Private 이벤트 {state or '-'} · REST 체결확인 예약",
+                    "market": market,
+                    "state": state,
+                    "identifier": identifier,
+                }
+            )
+
+    def _on_private_asset(self, event: dict[str, Any]) -> None:
+        self._private_asset_events += 1
+        # myAsset is an anomaly/refresh signal only. In particular, never copy
+        # account balance into Storage.managed_quantity; unrelated user holdings
+        # must remain outside JunhyunBank automated management.
+        assets = event.get("assets")
+        count = len(assets) if isinstance(assets, list) else 0
+        self.events.put(
+            {
+                "type": "private_asset",
+                "message": "Private 자산 변동 감지 · 정기 REST 잔고와 교차확인",
+                "asset_count": count,
+            }
+        )
+
+    def _consume_private_reconcile_requests(self) -> set[str]:
+        with self._private_reconcile_lock:
+            requested = set(self._private_reconcile_requested)
+            self._private_reconcile_requested.clear()
+        return requested
+
+    def _reconcile_orders(self) -> None:
+        """Reconcile durable intents with event acceleration and REST fallback.
+
+        ``myOrder`` events only wake this method up sooner. We still fetch the
+        canonical order object by our client identifier and feed the unchanged
+        atomic ``complete_order_intent`` path. This avoids building accounting
+        state from a transient WebSocket event and keeps restart recovery valid
+        even when the private stream is unavailable.
+        """
+        forced = self._consume_private_reconcile_requests()
+        now = time.monotonic()
+        pending = self.storage.pending_orders()
+        live_identifiers = {str(row.get("identifier") or "") for row in pending}
+        for stale in set(self._order_reconcile_retry_at) - live_identifiers:
+            self._order_reconcile_retry_at.pop(stale, None)
+            self._order_reconcile_failures.pop(stale, None)
+
+        for intent in pending:
+            if self._hard_stop.is_set():
+                return
+            identifier = str(intent.get("identifier") or "")
+            if not identifier:
+                continue
+            if identifier not in forced and now < self._order_reconcile_retry_at.get(identifier, 0.0):
+                continue
+            try:
+                detail = self.client.get_order(identifier=identifier)
+                if self.storage.complete_order_intent(identifier, detail):
+                    self.risk.report_api_success()
+                    self._order_reconcile_retry_at.pop(identifier, None)
+                    self._order_reconcile_failures.pop(identifier, None)
+                    if (
+                        intent["side"] == "SELL"
+                        and intent["market"] not in self.storage.managed_markets()
+                    ):
+                        self.strategy.notify_exit(intent["market"])
+                    self._emit(
+                        "trade",
+                        f"{intent['market']} {intent['side']} 주문 확인 완료 · 체결수량 {detail.get('executed_volume', '0')}",
+                    )
+                    continue
+
+                # A valid but non-terminal response is normal immediately after
+                # an IOC event. Poll again soon, while allowing another myOrder
+                # event to override this delay.
+                self.risk.report_api_success()
+                self._order_reconcile_failures[identifier] = 0
+                self._order_reconcile_retry_at[identifier] = time.monotonic() + 1.0
+            except Exception as exc:
+                # 404 can be transient just after an ambiguous POST. Repeated
+                # lookup failures back off so pending intents cannot monopolize
+                # the Exchange REST quota or stall the evaluation loop.
+                self.risk.report_api_failure()
+                failures = self._order_reconcile_failures.get(identifier, 0) + 1
+                self._order_reconcile_failures[identifier] = failures
+                delay = min(15.0, float(2 ** min(failures, 4)))
+                self._order_reconcile_retry_at[identifier] = time.monotonic() + delay
+                self._entry_status(
+                    intent["market"],
+                    f"주문 결과 확인 대기: {exc} · {delay:.0f}초 후 REST 재확인",
+                )
 
     @classmethod
     def _coerce_alert_flag(cls, value: Any) -> bool | None:

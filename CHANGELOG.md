@@ -1,3 +1,15 @@
+# V4.0.2 — Private 주문·자산 보조 reconciliation
+
+- authenticated Private WebSocket 한 연결에서 `myOrder` + `myAsset` 동시 구독.
+- 장시간 무이벤트가 정상인 private stream에 ping/reconnect 및 fresh JWT 적용.
+- Authorization/JWT가 오류/상태 로그에 노출되지 않도록 redaction.
+- `junhyunbank-` identifier 주문 이벤트만 durable intent REST reconciliation을 즉시 깨우도록 제한.
+- WebSocket 이벤트를 회계 정본으로 사용하지 않고 실제 체결/수수료/terminal 상태는 identifier REST 조회 후 기존 atomic accounting 적용.
+- Private WS 장애 시 기존 REST reconciliation fallback 유지.
+- pending 주문 REST 조회 실패에 2→4→8→15초 backoff를 적용하고 myOrder 이벤트는 backoff를 우회.
+- `myAsset`은 자산 변동 신호로만 사용하며 계정 전체 잔고를 자동관리 수량으로 추정하지 않음.
+- 상세 설계: [V4.0.2 Private Reconciliation](docs/V4_0_2_PRIVATE_RECONCILIATION.md).
+
 # V4.0.1 — 업데이트 사전검증·원자 롤백
 
 - 새 EXE를 정상 실행하기 전에 `--post-update-verify` 비거래 검증 모드로 현재 DB 스키마와 SQLite 무결성을 확인.
