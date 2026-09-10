@@ -91,6 +91,13 @@ def test_explicit_rejection_does_not_leave_pending_order(engine):
     assert not engine.storage.managed_markets()
 
 
+@pytest.mark.parametrize('code',[408,500,503])
+def test_server_timeout_or_failure_keeps_intent_pending(engine,code):
+    engine.client.error = UpbitAPIError('ambiguous',code)
+    buy(engine)
+    assert len(engine.storage.pending_orders()) == 1
+
+
 def test_missing_remaining_volume_is_not_terminal(engine):
     responses = iter([dict(uuid='exchange-1',state='wait'), fill()])
     engine.client.get_order = lambda **kwargs: next(responses)

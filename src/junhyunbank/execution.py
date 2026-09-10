@@ -4,7 +4,7 @@ import time
 from typing import Any
 import uuid
 
-from .models import EngineState, Position
+from .models import Position
 from .upbit import UpbitAPIError
 
 
@@ -31,7 +31,8 @@ class OrderExecution:
         if side == 'BUY' and not self.accepting_entries:
             return None
         retries = getattr(self, '_order_retry_at', {})
-        if time.monotonic() < retries.get(market, 0):
+        retry_key = (market, side)
+        if time.monotonic() < retries.get(retry_key, 0):
             self._entry_status(market, '최근 주문 오류 후 재시도 대기')
             return None
         if any(o['market'] == market for o in self.storage.pending_orders()):
@@ -47,8 +48,8 @@ class OrderExecution:
             self.risk.report_api_success()
         except Exception as exc:
             self.risk.report_api_failure()
-            self._order_retry_at = {**retries, market: time.monotonic()+60.0}
-            if isinstance(exc, UpbitAPIError) and exc.status_code is not None and 400 <= exc.status_code < 500:
+            self._order_retry_at = {**retries, retry_key: time.monotonic()+(60.0 if side == 'BUY' else 1.0)}
+            if isinstance(exc, UpbitAPIError) and exc.status_code is not None and 400 <= exc.status_code < 500 and exc.status_code != 408:
                 self.storage.reject_order_intent(identifier, str(exc))
             self._emit('error', f'{market} {side} 주문 응답 오류: {exc} · 불확실한 주문은 재전송하지 않고 조회합니다.')
             return None
