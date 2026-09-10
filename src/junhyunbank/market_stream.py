@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from collections.abc import Callable
+from typing import Any
 
 import websocket
 
@@ -14,20 +16,34 @@ class MarketStream:
     def __init__(
         self,
         markets: list[str],
-        on_price: Callable[[str, float], None] | None = None,
+        *,
+        on_trade: Callable[[dict[str, Any]], None] | None = None,
+        on_orderbook: Callable[[dict[str, Any]], None] | None = None,
         on_error: Callable[[str], None] | None = None,
+        orderbook_depth: int = 5,
+        name: str = "upbit-websocket",
     ) -> None:
         self.markets = list(dict.fromkeys(markets))
-        self.on_price = on_price
+        self.on_trade = on_trade
+        self.on_orderbook = on_orderbook
         self.on_error = on_error
+        self.orderbook_depth = orderbook_depth
+        self.name = name
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_message = 0.0
+
+    @property
+    def age_seconds(self) -> float:
+        if self._last_message <= 0:
+            return float("inf")
+        return max(0.0, time.monotonic() - self._last_message)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="upbit-websocket", daemon=True)
+        self._thread = threading.Thread(target=self._run, name=self.name, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -35,18 +51,35 @@ class MarketStream:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
 
+    def _subscription(self) -> list[dict[str, Any]]:
+        request: list[dict[str, Any]] = [{"ticket": str(uuid.uuid4())}]
+        if self.on_trade:
+            request.append(
+                {
+                    "type": "trade",
+                    "codes": self.markets,
+                    "is_only_realtime": True,
+                }
+            )
+        if self.on_orderbook:
+            depth = max(1, min(30, int(self.orderbook_depth)))
+            request.append(
+                {
+                    "type": "orderbook",
+                    "codes": [f"{market}.{depth}" for market in self.markets],
+                    "is_only_realtime": True,
+                }
+            )
+        request.append({"format": "DEFAULT"})
+        return request
+
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set() and self.markets:
             ws = None
             try:
                 ws = websocket.create_connection(self.URL, timeout=10)
-                request = [
-                    {"ticket": str(uuid.uuid4())},
-                    {"type": "ticker", "codes": self.markets, "is_only_realtime": True},
-                    {"format": "DEFAULT"},
-                ]
-                ws.send(json.dumps(request))
+                ws.send(json.dumps(self._subscription()))
                 backoff = 1.0
                 while not self._stop.is_set():
                     try:
@@ -57,10 +90,14 @@ class MarketStream:
                     if isinstance(payload, bytes):
                         payload = payload.decode("utf-8")
                     data = json.loads(payload)
-                    market = data.get("code")
-                    price = data.get("trade_price")
-                    if market and price is not None and self.on_price:
-                        self.on_price(str(market), float(price))
+                    if not isinstance(data, dict):
+                        continue
+                    self._last_message = time.monotonic()
+                    message_type = str(data.get("type") or "")
+                    if message_type == "trade" and self.on_trade:
+                        self.on_trade(data)
+                    elif message_type == "orderbook" and self.on_orderbook:
+                        self.on_orderbook(data)
             except Exception as exc:
                 if self.on_error and not self._stop.is_set():
                     self.on_error(f"WebSocket 재연결: {exc}")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import RiskConfig
+from .config import SafetyConfig
 
 
 @dataclass(slots=True)
@@ -12,49 +12,36 @@ class RiskCheck:
 
 
 class RiskManager:
-    def __init__(self, config: RiskConfig) -> None:
+    """투자전략의 고정 한도 없이 시스템 안전만 담당한다."""
+
+    def __init__(self, config: SafetyConfig) -> None:
         self.config = config
         self.emergency = False
-        self.daily_start_equity: float | None = None
+        self.api_failures = 0
 
-    def reset_session(self, equity: float) -> None:
+    def reset_session(self) -> None:
         self.emergency = False
-        self.daily_start_equity = max(0.0, equity)
+        self.api_failures = 0
 
     def trigger_emergency(self) -> None:
         self.emergency = True
 
-    def daily_loss_pct(self, current_equity: float) -> float:
-        if not self.daily_start_equity:
-            return 0.0
-        return max(0.0, 1.0 - current_equity / self.daily_start_equity)
+    def report_api_success(self) -> None:
+        self.api_failures = 0
 
-    def can_open(
-        self,
-        *,
-        current_equity: float,
-        available_cash: float,
-        open_position_count: int,
-    ) -> RiskCheck:
+    def report_api_failure(self) -> None:
+        self.api_failures += 1
+
+    def can_open(self, *, available_cash: float, amount_krw: float, min_order_krw: float, stream_age_seconds: float) -> RiskCheck:
         if self.emergency:
             return RiskCheck(False, "긴급 정지 상태")
-        if self.daily_loss_pct(current_equity) >= self.config.daily_loss_limit_pct:
-            return RiskCheck(False, "일일 최대 손실 한도 도달")
-        if open_position_count >= self.config.max_position_count:
-            return RiskCheck(False, "최대 보유 포지션 수 도달")
-        amount = self.config.order_krw
-        if amount < self.config.min_order_krw:
-            return RiskCheck(False, "설정 주문금액이 최소 주문금액보다 작음")
-        if available_cash < amount * (1.0 + self.config.fee_rate):
+        if self.api_failures >= self.config.max_api_failures:
+            return RiskCheck(False, "API 오류가 연속 발생하여 신규 주문을 차단함")
+        if stream_age_seconds > self.config.market_data_stale_seconds:
+            return RiskCheck(False, "실시간 시장 데이터가 오래되어 신규 주문을 차단함")
+        minimum = max(self.config.min_order_krw, min_order_krw)
+        if amount_krw < minimum:
+            return RiskCheck(False, "동적 주문금액이 업비트 최소 주문금액보다 작음")
+        if available_cash < amount_krw:
             return RiskCheck(False, "주문 가능 KRW 부족")
         return RiskCheck(True, "주문 가능")
-
-    def exit_reason(self, *, avg_price: float, current_price: float) -> str | None:
-        if avg_price <= 0 or current_price <= 0:
-            return None
-        pnl = current_price / avg_price - 1.0
-        if pnl <= -self.config.stop_loss_pct:
-            return f"손절 {pnl * 100:.2f}%"
-        if pnl >= self.config.take_profit_pct:
-            return f"익절 {pnl * 100:.2f}%"
-        return None

@@ -1,17 +1,26 @@
 # Changelog
 
-## V1 / 1.0.0
+## V2
 
-- 업비트 API Key 최초 입력 및 OS keyring 보관
-- PAPER / LIVE 모드 분리
-- 시작 / 종료 / 긴급 정지 UI
-- KRW 마켓 거래대금 기반 후보 자동 선정
-- 5분봉 Trend + RSI 기본 전략
-- WebSocket 실시간 가격 수신
-- 시장가 매수/매도 및 고유 주문 identifier
-- 손절/익절, 일일 최대 손실, 주문금액, 포지션 수 제한
-- JunhyunBank가 직접 연 LIVE 포지션만 자동 매도하도록 격리
-- 보유자산, 평가금액, 세션 수익률, 후보, 차트, 로그 UI
-- SQLite 이벤트/거래/관리 포지션 기록
-- pytest 및 GitHub Actions CI
-- main 병합 시 Windows 실행파일 빌드 및 V1/V2/V3 자동 Release
+- 모의매매 제거, LIVE 전용 실행
+- JH-MicroFlow 실시간 단타 엔진 도입
+- 전체 KRW trade WebSocket 감시와 후보 orderbook 정밀분석
+- 종목별 rolling percentile 기반 Activity/Aggression/Book/Momentum 신호
+- IGNITION / PULLBACK CONTINUATION 진입
+- 실제 수수료·스프레드·예상 슬리피지 비용 게이트
+- 고정 주문금액/거래횟수/포지션 수/익절·손절 제거
+- 동적 자금배분, 유동성 용량 계산, Adaptive Trailing 및 Emergency Stop
+- Strategy Health Governor 추가
+- 종료 버튼의 DRAINING 동작 추가
+- 보유자산에 KRW 표시, 보유자산/운영로그 UI 위치 교체
+- 최신 GitHub Release 자동 업데이트 및 재시작 기능
+- 업데이트 후 OS keyring API Key 및 SQLite 포지션 상태 유지
+- V1 SQLite 스키마 자동 마이그레이션
+
+## V1
+
+- 최초 업비트 자동매매 MVP
+- PAPER/LIVE 모드
+- 5분봉 Trend + RSI 전략
+- API Key keyring 저장
+- 기본 리스크 제한 및 거래 기록

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "junhyunbank"
-version = "1.0.0"
-description = "Safety-first Upbit automated trading desktop application"
+version = "2.0.0"
+description = "Live-only adaptive Upbit microstructure trading desktop application"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
