@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 from collections import defaultdict, deque
 from typing import Any
@@ -39,19 +40,20 @@ class ApiKeyDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self, engine: TradingEngine, key_store: KeyStore) -> None:
         super().__init__(); self.engine = engine; self.key_store = key_store
-        self._series: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=360)); self._chart_market: str | None = None
-        self._close_when_drained = False; self._update_in_progress = False
+        self._series: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=360)); self._chart_market: str | None = "KRW-BTC"
+        self._close_when_drained = False; self._update_in_progress = False; self._runtime: dict[str, Any] = {}
         self.setWindowTitle(f"JunhyunBank V{__version__.split('.')[0]}"); self.resize(1320, 820)
         root = QWidget(); layout = QVBoxLayout(root)
         controls = QHBoxLayout(); self.api_button = QPushButton("API 키 설정"); self.update_button = QPushButton("업데이트"); self.start_button = QPushButton("시작"); self.stop_button = QPushButton("종료"); self.emergency_button = QPushButton("긴급 정지")
         controls.addWidget(QLabel("LIVE 전용")); controls.addWidget(self.api_button); controls.addWidget(self.update_button); controls.addStretch(); controls.addWidget(self.start_button); controls.addWidget(self.stop_button); controls.addWidget(self.emergency_button); layout.addLayout(controls)
         summary = QHBoxLayout(); self.status = QLabel("대기"); self.equity = QLabel("총 평가: -"); self.cash = QLabel("KRW: -"); self.pnl = QLabel("세션 수익률: -"); self.health = QLabel("전략 건강도: -"); self.regime = QLabel("시장: -")
         summary.addWidget(self.status, 2); summary.addStretch(); summary.addWidget(self.equity); summary.addWidget(self.cash); summary.addWidget(self.pnl); summary.addWidget(self.health); summary.addWidget(self.regime); layout.addLayout(summary)
+        self.data_health = QLabel("데이터: 자동매매 시작 후 WebSocket 상태와 워밍업 진행률을 표시합니다."); self.data_health.setWordWrap(True); layout.addWidget(self.data_health)
         body = QHBoxLayout(); left = QVBoxLayout()
-        candidate_box = QGroupBox("실시간 후보"); candidate_layout = QVBoxLayout(candidate_box); self.candidates = QLabel("-"); self.candidates.setWordWrap(True); candidate_layout.addWidget(self.candidates); left.addWidget(candidate_box, 1)
+        candidate_box = QGroupBox("실시간 후보 / 현재가 / 품질점수"); candidate_layout = QVBoxLayout(candidate_box); self.candidates = QLabel("-"); self.candidates.setWordWrap(True); candidate_layout.addWidget(self.candidates); left.addWidget(candidate_box, 1)
         log_box = QGroupBox("운영 로그"); log_layout = QVBoxLayout(log_box); self.log = QTextEdit(); self.log.setReadOnly(True); log_layout.addWidget(self.log); left.addWidget(log_box, 5); body.addLayout(left, 1)
         right = QVBoxLayout(); asset_box = QGroupBox("보유 자산"); asset_layout = QVBoxLayout(asset_box); self.assets = QTableWidget(0, 6); self.assets.setHorizontalHeaderLabels(["자산", "수량", "평균단가", "현재가", "평가금액", "자동관리"]); self.assets.horizontalHeader().setStretchLastSection(True); asset_layout.addWidget(self.assets); right.addWidget(asset_box, 2)
-        chart_box = QGroupBox("실시간 가격"); chart_layout = QVBoxLayout(chart_box); self.chart_title = QLabel("후보 종목의 실시간 가격을 표시합니다."); self.chart = pg.PlotWidget(); self.curve = self.chart.plot([]); chart_layout.addWidget(self.chart_title); chart_layout.addWidget(self.chart); right.addWidget(chart_box, 3); body.addLayout(right, 3); layout.addLayout(body, 1); self.setCentralWidget(root)
+        chart_box = QGroupBox("실시간 가격"); chart_layout = QVBoxLayout(chart_box); self.chart_title = QLabel("KRW-BTC 실시간 가격 수신 대기"); self.chart = pg.PlotWidget(); self.curve = self.chart.plot([]); chart_layout.addWidget(self.chart_title); chart_layout.addWidget(self.chart); right.addWidget(chart_box, 3); body.addLayout(right, 3); layout.addLayout(body, 1); self.setCentralWidget(root)
         self.api_button.clicked.connect(self.configure_api); self.update_button.clicked.connect(self.check_for_update); self.start_button.clicked.connect(self.start_trading); self.stop_button.clicked.connect(self.stop_trading); self.emergency_button.clicked.connect(self.emergency_stop)
         self.timer = QTimer(self); self.timer.timeout.connect(self.poll_events); self.timer.start(200); self._sync_buttons()
 
@@ -64,12 +66,14 @@ class MainWindow(QMainWindow):
             access, secret = self.key_store.load(); self.engine.client.access_key = access; self.engine.client.secret_key = secret; self.log.append("[security] 새 API 키를 현재 세션에 적용했습니다.")
 
     def start_trading(self) -> None:
-        if not self.key_store.exists(): QMessageBox.warning(self, "API 키 필요", "JunhyunBank V2는 LIVE 전용이므로 업비트 API 키가 필요합니다."); return
+        if not self.key_store.exists(): QMessageBox.warning(self, "API 키 필요", "JunhyunBank V3는 LIVE 전용이므로 업비트 API 키가 필요합니다."); return
         result = QMessageBox.warning(self, "실거래 시작", "JunhyunBank는 실제 원화로 자동 주문합니다. LIVE 자동매매를 시작하시겠습니까?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if result == QMessageBox.StandardButton.Yes: self.start_trading_silent()
 
     def start_trading_silent(self) -> None:
-        try: self.engine.start(); self._sync_buttons()
+        try:
+            self.data_health.setText("데이터: WebSocket 연결 중 · 전략 워밍업은 기본 약 3분입니다.")
+            self.engine.start(); self._sync_buttons()
         except Exception as exc: QMessageBox.critical(self, "시작 실패", str(exc))
 
     def stop_trading(self) -> None:
@@ -103,14 +107,53 @@ class MainWindow(QMainWindow):
             except Exception as exc: self.engine.events.put({"type": "update_error", "message": f"업데이트 실패: {exc}"})
         threading.Thread(target=worker, name="update-download", daemon=True).start()
 
+    @staticmethod
+    def _age_text(value: Any) -> str:
+        if value is None:
+            return "수신없음"
+        try:
+            age = float(value)
+        except (TypeError, ValueError):
+            return "수신없음"
+        if not math.isfinite(age):
+            return "수신없음"
+        return f"{age:.1f}초 전"
+
+    def _runtime_event(self, event: dict[str, Any]) -> None:
+        self._runtime = event
+        global_connected = int(event.get("global_connected", 0)); global_total = int(event.get("global_total", 0))
+        deep_connected = bool(event.get("deep_connected")); deep_count = int(event.get("deep_markets", 0))
+        tracked = int(event.get("tracked_markets", 0)); warmed = int(event.get("warmed_markets", 0)); allowed = int(event.get("allowed_markets", 0)); candidates = int(event.get("candidate_count", 0))
+        trade_age = self._age_text(event.get("trade_age")); deep_age = self._age_text(event.get("deep_age")) if deep_count else "후보 대기"
+        deep_state = "연결" if deep_connected else ("대기" if deep_count == 0 else "재연결")
+        self.data_health.setText(f"데이터: Trade WS {global_connected}/{global_total} · 마지막 체결 {trade_age} · 추적 {tracked}/{allowed} · 워밍업 완료 {warmed} · 후보 {candidates} · Orderbook {deep_state}({deep_count}) / {deep_age}")
+        if not candidates and float(event.get("elapsed", 0.0)) < 180.0:
+            self.candidates.setText(f"전략 워밍업 중 · 실시간 가격 추적 {tracked}개 시장")
+
     def poll_events(self) -> None:
         for event in self.engine.drain_events():
             event_type = event.get("type")
             if event_type == "price": self._price_event(event)
             elif event_type == "portfolio": self._portfolio_event(event)
             elif event_type == "candidates":
-                markets, scores = event.get("markets", []), event.get("scores", {}); self.candidates.setText("\n".join(f"{m}  {float(scores.get(m, 0.0)):.1f}" for m in markets) or "-")
-                if markets and not self._chart_market: self._chart_market = str(markets[0])
+                markets, scores, prices = event.get("markets", []), event.get("scores", {}), event.get("prices", {})
+                lines = []
+                for market in markets:
+                    price = prices.get(market)
+                    price_text = f"{float(price):,.4f}원" if price else "가격 수신중"
+                    lines.append(f"{market}  {price_text}  Q {float(scores.get(market, 0.0)):.1f}")
+                if lines:
+                    self.candidates.setText("\n".join(lines))
+                    if self._chart_market not in markets:
+                        self._chart_market = str(markets[0]); self.curve.setData(list(self._series[self._chart_market]))
+                elif float(self._runtime.get("elapsed", 0.0)) >= 180.0:
+                    self.candidates.setText("후보 없음 · 위 데이터 상태를 확인하세요.")
+            elif event_type == "runtime_health": self._runtime_event(event)
+            elif event_type == "stream_status":
+                if event.get("state") == "reconnecting":
+                    self.log.append(f"[websocket] {event.get('name')}: 재연결 · {event.get('message', '')}")
+            elif event_type == "deep_set":
+                pass
             elif event_type == "strategy_health": self.health.setText(f"전략 건강도: {float(event.get('health', 0.0)):.2f}"); self.regime.setText(f"시장: {event.get('regime', '-')}")
             elif event_type == "update_check": self._confirm_update(event.get("info"))
             elif event_type == "update_error":

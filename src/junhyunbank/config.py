@@ -19,9 +19,13 @@ class StrategyConfig:
     scanner_candidate_count: int = 30
     deep_candidate_count: int = 24
     candidate_refresh_seconds: float = 3.0
+    deep_min_residency_seconds: float = 30.0
+    deep_switch_margin: float = 4.0
     market_refresh_seconds: float = 300.0
     evaluation_seconds: float = 1.0
     portfolio_publish_seconds: float = 1.0
+    runtime_health_seconds: float = 1.0
+    no_candidate_warning_seconds: float = 300.0
     orderbook_depth: int = 5
     activity_window_seconds: int = 5
     aggression_window_seconds: int = 5
