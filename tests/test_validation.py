@@ -71,3 +71,26 @@ def test_summary_separates_buy_and_holdout_without_optimizing_thresholds():
     assert horizon["holdout_buy"]["positive_net_rate"] == pytest.approx(1.0)
     assert horizon["all"]["expected_move_coverage_rate"] == pytest.approx(1.0)
     assert horizon["all"]["median_abs_to_expected_ratio"] == pytest.approx(0.75)
+
+
+def test_hold_compact_decision_can_use_feature_expected_move_for_calibration():
+    samples = [
+        {
+            "created_epoch_ms": 1,
+            "market": "KRW-X",
+            "signal": "HOLD",
+            "expected_move_pct": 0.0,
+            "features": {"expected_move": 0.02},
+            "labels": {
+                "30": {
+                    "net_return": -0.001,
+                    "absolute_mid_move": 0.01,
+                }
+            },
+        }
+    ]
+
+    report = summarize_samples(samples, [30])
+    row = report["horizons"]["30"]["all"]
+    assert row["mean_expected_move"] == pytest.approx(0.02)
+    assert row["median_abs_to_expected_ratio"] == pytest.approx(0.5)
