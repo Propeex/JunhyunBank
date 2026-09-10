@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import threading
 import time
 
 from junhyunbank.market_stream import MarketStream
+
+
+def _console_safe(value: str) -> str:
+    # GitHub-hosted Windows PowerShell can expose a legacy single-byte console
+    # encoding. Keep smoke diagnostics printable there even if an exception or
+    # callback contains Korean/Unicode text.
+    return value.encode("ascii", errors="backslashreplace").decode("ascii")
 
 
 def run_once(timeout: float) -> tuple[bool, str]:
@@ -37,7 +43,7 @@ def run_once(timeout: float) -> tuple[bool, str]:
     try:
         while time.monotonic() < deadline:
             if got_trade.is_set() and got_orderbook.is_set():
-                return True, f"trade/orderbook 수신 성공 · messages={stream.message_count}"
+                return True, f"trade/orderbook received; messages={stream.message_count}"
             time.sleep(0.10)
         detail = errors[-1] if errors else stream.last_error or "timeout"
         return False, (
@@ -57,7 +63,7 @@ def main() -> int:
     attempts = max(1, args.attempts)
     for attempt in range(1, attempts + 1):
         ok, detail = run_once(max(5.0, args.timeout))
-        print(f"[attempt {attempt}/{attempts}] {detail}", flush=True)
+        print(_console_safe(f"[attempt {attempt}/{attempts}] {detail}"), flush=True)
         if ok:
             return 0
         if attempt < attempts:
