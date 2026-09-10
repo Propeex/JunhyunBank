@@ -45,7 +45,7 @@ class UpbitClient:
         self.http = httpx.Client(
             base_url=self.BASE_URL,
             timeout=timeout,
-            headers={"Accept": "application/json", "User-Agent": "JunhyunBank/2.0"},
+            headers={"Accept": "application/json", "User-Agent": "JunhyunBank/3.0"},
         )
         self._private_lock = threading.Lock()
         self._last_private_request = 0.0
@@ -130,8 +130,32 @@ class UpbitClient:
                 return response.json()
         raise UpbitAPIError("업비트 요청 제한(429)이 반복되어 요청을 중단했습니다.")
 
+    @staticmethod
+    def _normalize_market_rows(payload: Any) -> list[dict[str, Any]]:
+        if not isinstance(payload, list):
+            raise UpbitAPIError("업비트 페어 목록 응답 형식이 배열이 아닙니다.")
+        rows = [row for row in payload if isinstance(row, dict)]
+        if not rows:
+            raise UpbitAPIError("업비트 페어 목록 응답이 비어 있습니다.")
+        return rows
+
     def get_markets(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/v1/market/all", params={"is_details": "true"})
+        # Current Upbit documentation uses `is_details`. Some deployed/client
+        # combinations have historically used `isDetails`, so if the first
+        # successful response contains no market_event objects at all, retry the
+        # legacy spelling instead of silently running without alert metadata.
+        rows = self._normalize_market_rows(
+            self._request("GET", "/v1/market/all", params={"is_details": "true"})
+        )
+        if any(isinstance(row.get("market_event"), dict) for row in rows):
+            return rows
+
+        legacy_rows = self._normalize_market_rows(
+            self._request("GET", "/v1/market/all", params={"isDetails": "true"})
+        )
+        if any(isinstance(row.get("market_event"), dict) for row in legacy_rows):
+            return legacy_rows
+        return rows
 
     def get_all_krw_tickers(self) -> list[dict[str, Any]]:
         return self._request(

@@ -1,5 +1,23 @@
 # Changelog
 
+## V3.0.1
+
+- `Trade WS 0/0`, `추적 0/0`, 후보 0 상태로 조용히 멈추는 KRW 마켓 유니버스 실패 경로 보강
+- Upbit `market_event` 경보 필드를 Python truthiness가 아닌 명시적 bool/string 값으로 안전하게 해석
+- `is_details` 응답에 경보 상세가 없을 때 legacy `isDetails` 표기로 1회 호환 재조회
+- KRW 마켓은 존재하지만 안전하게 해석 가능한 종목이 0개면 명확한 오류/진단 로그 출력
+- 마켓 탐색 실패 시 10초 backoff를 적용해 빈 유니버스 상태에서 REST API를 과도하게 재호출하지 않도록 수정
+- Release smoke test가 실제 `/v1/market/all` → 안전 KRW 필터 → Public WebSocket 경로 전체를 검증하도록 확대
+- 패치 릴리즈가 기존 `V3` 태그에 막히지 않도록 semantic release tag(`V3.0.1` 등) 지원
+
+## V3
+
+- Public WebSocket Origin suppression 적용
+- deep orderbook 연결을 후보 변경마다 재생성하지 않고 live subscription 갱신 방식으로 안정화
+- Trade WS/마지막 체결/워밍업/후보/Orderbook 상태 진단 UI 추가
+- 후보별 현재가 표시와 KRW-BTC 기본 차트 추가
+- 단일 인스턴스 실행 보호 및 실제 Upbit read-only WebSocket smoke test 추가
+
 ## V2
 
 - 모의매매 제거, LIVE 전용 실행

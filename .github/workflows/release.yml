@@ -23,7 +23,7 @@ jobs:
           pip install pyinstaller
       - name: Unit and regression tests
         run: pytest -q
-      - name: Read-only Upbit public WebSocket smoke test
+      - name: Read-only Upbit market discovery and public WebSocket smoke test
         run: python scripts/smoke_upbit_public_ws.py --timeout 20 --attempts 3
       - name: Build Windows executable
         run: pyinstaller --clean --noconfirm --onefile --windowed --name JunhyunBank launcher.py
@@ -31,8 +31,7 @@ jobs:
         shell: pwsh
         run: |
           $version = python -c "from junhyunbank import __version__; print(__version__)"
-          $major = ($version.Trim() -split '\.')[0]
-          "TAG=V$major" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TAG=V$($version.Trim())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Create release if missing
         shell: pwsh
         env:

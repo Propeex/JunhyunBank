@@ -20,3 +20,54 @@ def test_authorization_contains_query_hash():
     expected = hashlib.sha512(b"market=KRW-BTC&count=10").hexdigest()
     assert payload["query_hash"] == expected
     assert payload["query_hash_alg"] == "SHA512"
+
+
+def test_get_markets_retries_legacy_details_spelling_when_needed():
+    client = UpbitClient()
+    calls = []
+    payloads = [
+        [{"market": "KRW-BTC", "korean_name": "BTC"}],
+        [
+            {
+                "market": "KRW-BTC",
+                "korean_name": "BTC",
+                "market_event": {"warning": False, "caution": {}},
+            }
+        ],
+    ]
+
+    def fake_request(method, path, **kwargs):
+        calls.append(kwargs.get("params"))
+        return payloads[len(calls) - 1]
+
+    client._request = fake_request
+    try:
+        rows = client.get_markets()
+    finally:
+        client.close()
+
+    assert rows[0]["market_event"]["warning"] is False
+    assert calls == [{"is_details": "true"}, {"isDetails": "true"}]
+
+
+def test_get_markets_uses_current_details_response_without_second_call():
+    client = UpbitClient()
+    calls = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append(kwargs.get("params"))
+        return [
+            {
+                "market": "KRW-BTC",
+                "market_event": {"warning": False, "caution": {}},
+            }
+        ]
+
+    client._request = fake_request
+    try:
+        rows = client.get_markets()
+    finally:
+        client.close()
+
+    assert rows[0]["market"] == "KRW-BTC"
+    assert calls == [{"is_details": "true"}]
