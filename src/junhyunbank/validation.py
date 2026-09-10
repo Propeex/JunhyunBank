@@ -137,6 +137,18 @@ def chronological_split(
     return ordered[:cut], ordered[cut:]
 
 
+def _sample_expected_move(sample: dict[str, Any]) -> Any:
+    direct = _finite_float(sample.get("expected_move_pct"))
+    if direct is not None and direct > 0:
+        return direct
+    features = sample.get("features")
+    if isinstance(features, dict):
+        feature_value = _finite_float(features.get("expected_move"))
+        if feature_value is not None and feature_value > 0:
+            return feature_value
+    return None
+
+
 def summarize_samples(
     samples: Iterable[dict[str, Any]],
     horizons: Iterable[int],
@@ -164,7 +176,11 @@ def summarize_samples(
             if not isinstance(label, dict):
                 continue
             merged = dict(label)
-            merged["expected_move_pct"] = sample.get("expected_move_pct")
+            # Several HOLD branches intentionally return a compact decision and
+            # do not repeat expected_move_pct. The feature snapshot is the
+            # canonical value for ExpectedMove calibration across both BUY and
+            # rejected candidate observations.
+            merged["expected_move_pct"] = _sample_expected_move(sample)
             result.append(merged)
         return result
 
