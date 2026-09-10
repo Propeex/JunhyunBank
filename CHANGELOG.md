@@ -1,3 +1,17 @@
+# V4.0.4 — Raw market data recorder
+
+- API Key와 주문 API를 사용하지 않는 `scripts/record_public_market.py` 추가.
+- 전체 안전 KRW 시장의 raw trade와 현재 Hot 후보의 L2 orderbook을 replay용 JSONL로 기록.
+- exchange timestamp, local receive timestamp/monotonic timestamp, process sequence를 함께 저장해 이후 수신순서 기반 deterministic replay를 지원.
+- WebSocket callback은 bounded queue에 `put_nowait`만 수행하고 파일 I/O·fsync·rotation·gzip은 background thread로 분리.
+- queue 포화 시 거래/시세 callback을 block하지 않고 recorder event를 drop하며 `dropped` 통계와 nonzero exit code로 데이터 불완전성을 노출.
+- 활성 `.jsonl.part` → fsync → atomic `.jsonl` finalize, 별도 `.jsonl.gz.part` → atomic gzip finalize 순서로 crash-safe 보존.
+- 비정상 종료 후 `.jsonl.part`의 torn trailing line을 제거하고 완전한 레코드까지 자동 복구.
+- segment size/time rotation과 총 bytes/file-count retention 추가.
+- finalized `.jsonl`/`.jsonl.gz`를 읽는 `iter_records()`를 추가해 다음 deterministic replay 단계의 입력 계약을 고정.
+- 실거래 engine/execution/managed quantity/전략 threshold는 변경하지 않음.
+- 상세 설계: [V4.0.4 Raw Market Data Recorder](docs/V4_0_4_MARKET_RECORDER.md).
+
 # V4.0.3 — Read-only forward-edge 검증 기반
 
 - API Key와 주문 API를 전혀 사용하지 않는 `scripts/validate_public_edge.py` 추가.
