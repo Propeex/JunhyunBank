@@ -158,7 +158,13 @@ class TradingEngine:
 
     def _evaluate_cycle(self) -> None:
         decisions: dict[str, Any] = {}
-        for market in self._candidates:
+        evaluation_markets = list(self._candidates)
+        if self._mode == TradingMode.LIVE:
+            for market in sorted(self.storage.managed_markets()):
+                if market not in evaluation_markets:
+                    evaluation_markets.append(market)
+
+        for market in evaluation_markets:
             if self._stop.is_set():
                 return
             try:
@@ -187,6 +193,8 @@ class TradingEngine:
         return value
 
     def _trade_paper(self, decisions: dict[str, Any]) -> None:
+        if self._stop.is_set() or self.risk.emergency:
+            return
         position = self._paper.position
         if position:
             price = self._latest_prices.get(position.market)
@@ -282,14 +290,32 @@ class TradingEngine:
         missing = [m for m in markets if m not in prices]
         if missing:
             for row in self.client.get_tickers(missing):
-                prices[str(row["market"])] = float(row["trade_price"])
+                market = str(row["market"])
+                price = float(row["trade_price"])
+                prices[market] = price
+                self._latest_prices[market] = price
         equity = cash + sum(p.market_value(prices.get(p.market, p.avg_price)) for p in positions)
         return equity, cash, positions
 
     def _trade_live(self, decisions: dict[str, Any]) -> None:
+        if self._stop.is_set() or self.risk.emergency:
+            return
+
         with self._order_lock:
             equity, cash, positions = self._live_portfolio()
-            for position in positions:
+            positions_by_market = {p.market: p for p in positions}
+            managed = self.storage.managed_markets()
+
+            # Clean up persisted state only when the exchange confirms the asset is gone.
+            for market in managed - set(positions_by_market):
+                self.storage.unmark_managed_position(market)
+            managed &= set(positions_by_market)
+
+            # Never auto-sell assets that were not opened by JunhyunBank.
+            for market in sorted(managed):
+                if self._stop.is_set() or self.risk.emergency:
+                    return
+                position = positions_by_market[market]
                 price = self._latest_prices.get(position.market)
                 if not price or position.quantity <= 0:
                     continue
@@ -300,6 +326,8 @@ class TradingEngine:
                 strategy_exit = bool(decision and decision.signal == Signal.SELL)
                 if risk_exit or strategy_exit:
                     reason = risk_exit or decision.reason
+                    if self._stop.is_set() or self.risk.emergency:
+                        return
                     order = self.client.place_market_sell(position.market, position.quantity)
                     self.storage.trade(
                         mode=self._mode.value,
@@ -314,7 +342,7 @@ class TradingEngine:
                     self._emit("trade", f"[LIVE] {position.market} 매도 주문: {reason}")
                     return
 
-            held = {p.market for p in positions}
+            held = set(positions_by_market)
             buys = [
                 (market, decision)
                 for market, decision in decisions.items()
@@ -326,12 +354,15 @@ class TradingEngine:
             check = self.risk.can_open(
                 current_equity=equity,
                 available_cash=cash,
-                open_position_count=len(positions),
+                open_position_count=len(managed),
             )
             if not check.allowed:
                 self._emit("risk", f"매수 차단: {check.reason}")
                 return
+            if self._stop.is_set() or self.risk.emergency:
+                return
             order = self.client.place_market_buy(market, self.config.risk.order_krw)
+            self.storage.mark_managed_position(market)
             self.storage.trade(
                 mode=self._mode.value,
                 market=market,

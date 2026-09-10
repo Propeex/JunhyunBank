@@ -161,7 +161,11 @@ class MainWindow(QMainWindow):
         self.timer.start(250)
 
     def configure_api(self) -> None:
-        ApiKeyDialog(self.key_store, self).exec()
+        if ApiKeyDialog(self.key_store, self).exec():
+            access, secret = self.key_store.load()
+            self.engine.client.access_key = access
+            self.engine.client.secret_key = secret
+            self.log.append("[security] 새 API 키를 현재 세션에 적용했습니다.")
 
     def start_trading(self) -> None:
         mode = TradingMode(self.mode.currentText())

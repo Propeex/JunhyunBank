@@ -91,13 +91,15 @@ class UpbitClient:
         private: bool = False,
     ) -> Any:
         auth_values = json_body if json_body is not None else params
-        headers: dict[str, str] = {}
-        if private:
-            headers["Authorization"] = self._authorization(auth_values)
-        if json_body is not None:
-            headers["Content-Type"] = "application/json"
 
         for attempt in range(3):
+            headers: dict[str, str] = {}
+            # Private API retries must use a fresh nonce/JWT on every attempt.
+            if private:
+                headers["Authorization"] = self._authorization(auth_values)
+            if json_body is not None:
+                headers["Content-Type"] = "application/json"
+
             response = self.http.request(
                 method,
                 path,

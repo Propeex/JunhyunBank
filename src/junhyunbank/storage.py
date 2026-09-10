@@ -49,6 +49,14 @@ class Storage:
                 )
                 '''
             )
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS managed_positions (
+                    market TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                )
+                '''
+            )
 
     def event(
         self,
@@ -101,3 +109,23 @@ class Storage:
                     exchange_order_id,
                 ),
             )
+
+    def mark_managed_position(self, market: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO managed_positions(market, created_at)
+                VALUES(?, ?)
+                ON CONFLICT(market) DO NOTHING
+                ''',
+                (market, datetime.now().isoformat(timespec="seconds")),
+            )
+
+    def unmark_managed_position(self, market: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM managed_positions WHERE market = ?", (market,))
+
+    def managed_markets(self) -> set[str]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT market FROM managed_positions").fetchall()
+        return {str(row[0]) for row in rows}
