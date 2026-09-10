@@ -38,6 +38,7 @@ class TradingEngine:
         self._thread: threading.Thread | None = None
         self._stream: MarketStream | None = None
         self._latest_prices: dict[str, float] = {}
+        self._last_price_ui_emit: dict[str, float] = {}
         self._candidates: list[str] = []
         self._mode = TradingMode.PAPER
         self._paper = PaperPortfolio(self.config.paper_starting_cash)
@@ -92,7 +93,11 @@ class TradingEngine:
 
     def _on_price(self, market: str, price: float) -> None:
         self._latest_prices[market] = price
-        self.events.put({"type": "price", "market": market, "price": price})
+        now = time.monotonic()
+        last = self._last_price_ui_emit.get(market, 0.0)
+        if now - last >= 0.25:
+            self._last_price_ui_emit[market] = now
+            self.events.put({"type": "price", "market": market, "price": price})
 
     def _restart_stream(self, markets: list[str]) -> None:
         if self._stream:
@@ -142,7 +147,14 @@ class TradingEngine:
                 now = time.monotonic()
                 if now >= next_candidate_refresh or not self._candidates:
                     self._candidates = self._select_candidates()
-                    self._restart_stream(self._candidates)
+                    stream_markets = list(self._candidates)
+                    if self._mode == TradingMode.LIVE:
+                        for market in sorted(self.storage.managed_markets()):
+                            if market not in stream_markets:
+                                stream_markets.append(market)
+                    elif self._paper.position and self._paper.position.market not in stream_markets:
+                        stream_markets.append(self._paper.position.market)
+                    self._restart_stream(stream_markets)
                     next_candidate_refresh = now + self.config.strategy.candidate_refresh_seconds
 
                 self._evaluate_cycle()
@@ -163,6 +175,8 @@ class TradingEngine:
             for market in sorted(self.storage.managed_markets()):
                 if market not in evaluation_markets:
                     evaluation_markets.append(market)
+        elif self._paper.position and self._paper.position.market not in evaluation_markets:
+            evaluation_markets.append(self._paper.position.market)
 
         for market in evaluation_markets:
             if self._stop.is_set():
@@ -306,13 +320,12 @@ class TradingEngine:
             positions_by_market = {p.market: p for p in positions}
             managed = self.storage.managed_markets()
 
-            # Clean up persisted state only when the exchange confirms the asset is gone.
-            for market in managed - set(positions_by_market):
-                self.storage.unmark_managed_position(market)
-            managed &= set(positions_by_market)
+            # Keep the managed marker even if a newly accepted buy is not visible
+            # in balances yet. This prevents a duplicate buy on the next cycle.
+            active_managed = managed & set(positions_by_market)
 
             # Never auto-sell assets that were not opened by JunhyunBank.
-            for market in sorted(managed):
+            for market in sorted(active_managed):
                 if self._stop.is_set() or self.risk.emergency:
                     return
                 position = positions_by_market[market]
@@ -329,6 +342,7 @@ class TradingEngine:
                     if self._stop.is_set() or self.risk.emergency:
                         return
                     order = self.client.place_market_sell(position.market, position.quantity)
+                    self.storage.unmark_managed_position(position.market)
                     self.storage.trade(
                         mode=self._mode.value,
                         market=position.market,
@@ -346,7 +360,7 @@ class TradingEngine:
             buys = [
                 (market, decision)
                 for market, decision in decisions.items()
-                if decision.signal == Signal.BUY and market not in held
+                if decision.signal == Signal.BUY and market not in held and market not in managed
             ]
             if not buys:
                 return
