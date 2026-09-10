@@ -1,43 +1,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
-
-
-class TradingMode(str, Enum):
-    PAPER = "PAPER"
-    LIVE = "LIVE"
 
 
 @dataclass(slots=True)
-class RiskConfig:
-    order_krw: float = 10_000.0
-    max_position_count: int = 1
-    stop_loss_pct: float = 0.02
-    take_profit_pct: float = 0.04
-    daily_loss_limit_pct: float = 0.03
+class SafetyConfig:
     min_order_krw: float = 5_000.0
-    fee_rate: float = 0.0005
+    market_data_stale_seconds: float = 3.0
+    order_guard_seconds: float = 0.8
+    max_api_failures: int = 5
+    settlement_grace_seconds: float = 8.0
 
 
 @dataclass(slots=True)
 class StrategyConfig:
-    candidate_count: int = 8
-    candle_unit: int = 5
-    candle_count: int = 120
-    fast_ma: int = 10
-    slow_ma: int = 30
-    rsi_period: int = 14
-    rsi_entry_min: float = 50.0
-    rsi_entry_max: float = 68.0
-    rsi_exit: float = 75.0
-    min_24h_trade_value: float = 2_000_000_000.0
-    candidate_refresh_seconds: int = 60
-    evaluation_seconds: int = 15
+    baseline_seconds: int = 1_800
+    min_warmup_seconds: int = 180
+    scanner_candidate_count: int = 30
+    deep_candidate_count: int = 24
+    candidate_refresh_seconds: float = 3.0
+    market_refresh_seconds: float = 300.0
+    evaluation_seconds: float = 1.0
+    portfolio_publish_seconds: float = 1.0
+    orderbook_depth: int = 5
+    activity_window_seconds: int = 5
+    aggression_window_seconds: int = 5
+    momentum_window_seconds: int = 10
+    long_momentum_window_seconds: int = 30
+    expected_move_window_seconds: int = 30
+    ignition_quality: float = 0.82
+    pullback_quality: float = 0.76
+    fee_cache_seconds: float = 3_600.0
+    health_lookback: int = 50
 
 
 @dataclass(slots=True)
 class AppConfig:
-    risk: RiskConfig = field(default_factory=RiskConfig)
+    safety: SafetyConfig = field(default_factory=SafetyConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
-    paper_starting_cash: float = 1_000_000.0

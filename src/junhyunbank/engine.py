@@ -3,78 +3,96 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
-from .config import AppConfig, TradingMode
+from .config import AppConfig
+from .health import StrategyHealthGovernor
 from .market_stream import MarketStream
-from .models import Position, Signal
+from .models import EngineState, Position, Signal
 from .risk import RiskManager
 from .storage import Storage
-from .strategy import TrendRSIStrategy
+from .strategy import BookSnapshot, MicroFlowStrategy
 from .upbit import UpbitAPIError, UpbitClient
 
 
-@dataclass(slots=True)
-class PaperPortfolio:
-    cash: float
-    position: Position | None = None
-
-
 class TradingEngine:
-    def __init__(
-        self,
-        client: UpbitClient,
-        config: AppConfig | None = None,
-        storage: Storage | None = None,
-    ) -> None:
+    def __init__(self, client: UpbitClient, config: AppConfig | None = None, storage: Storage | None = None) -> None:
         self.client = client
         self.config = config or AppConfig()
         self.storage = storage or Storage()
-        self.strategy = TrendRSIStrategy(self.config.strategy)
-        self.risk = RiskManager(self.config.risk)
+        self.strategy = MicroFlowStrategy(self.config.strategy)
+        self.risk = RiskManager(self.config.safety)
+        self.health_governor = StrategyHealthGovernor(minimum_samples=max(8, self.config.strategy.health_lookback // 5))
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
-        self._stop = threading.Event()
+        self._hard_stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._stream: MarketStream | None = None
+        self._state = EngineState.STOPPED
+        self._global_streams: list[MarketStream] = []
+        self._deep_stream: MarketStream | None = None
+        self._allowed_markets: list[str] = []
+        self._deep_markets: list[str] = []
         self._latest_prices: dict[str, float] = {}
         self._last_price_ui_emit: dict[str, float] = {}
-        self._candidates: list[str] = []
-        self._mode = TradingMode.PAPER
-        self._paper = PaperPortfolio(self.config.paper_starting_cash)
         self._order_lock = threading.Lock()
+        self._fee_cache: dict[str, tuple[float, float, float, float, float]] = {}
+        self._session_start_equity: float | None = None
+        self._update_shutdown = False
 
     @property
     def running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
-    def start(self, mode: TradingMode) -> None:
+    @property
+    def state(self) -> EngineState:
+        return self._state
+
+    @property
+    def accepting_entries(self) -> bool:
+        return self._state == EngineState.RUNNING and not self.risk.emergency
+
+    def wait(self, timeout: float = 5.0) -> None:
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(0.0, timeout))
+
+    def start(self) -> None:
         if self.running:
             return
-        self._mode = mode
-        self._stop.clear()
-        if mode == TradingMode.PAPER:
-            equity = self._paper_equity()
-        else:
-            equity, _, _ = self._live_portfolio()
-        self.risk.reset_session(equity)
+        if not self.client.access_key or not self.client.secret_key:
+            raise RuntimeError("업비트 API 키가 필요합니다.")
+        self.risk.reset_session()
+        self._hard_stop.clear()
+        self._update_shutdown = False
+        equity, _, _, _ = self._live_portfolio()
+        self._session_start_equity = equity
+        self._state = EngineState.RUNNING
         self._thread = threading.Thread(target=self._run, name="trading-engine", daemon=True)
         self._thread.start()
-        self._emit("status", f"{mode.value} 자동매매 시작")
+        self._emit("status", "LIVE 자동매매 시작")
 
     def request_stop(self) -> None:
-        self._stop.set()
-        self._emit("status", "정상 종료 요청")
+        if not self.running:
+            self._state = EngineState.STOPPED
+            self._emit("status", "이미 자동매매가 종료되어 있습니다.")
+            return
+        if self._state == EngineState.DRAINING:
+            return
+        self._state = EngineState.DRAINING
+        self._emit("status", "종료 대기: 신규 매수를 중단하고 JunhyunBank 보유 포지션의 전략 청산을 기다립니다.")
 
     def emergency_stop(self) -> None:
         self.risk.trigger_emergency()
-        self._stop.set()
-        self._emit(
-            "emergency",
-            "긴급 정지: 신규 주문과 전략 실행을 즉시 차단했습니다. 기존 보유 자산은 자동 청산하지 않습니다.",
-        )
+        self._state = EngineState.STOPPED
+        self._hard_stop.set()
+        self._emit("emergency", "긴급 정지: 신규 주문과 전략 실행을 즉시 중단했습니다. 보유 포지션은 강제 청산하지 않습니다.")
 
-    def drain_events(self, limit: int = 100) -> list[dict[str, Any]]:
+    def shutdown_for_update(self) -> None:
+        self._update_shutdown = True
+        self._state = EngineState.STOPPED
+        self._hard_stop.set()
+        self._emit("status", "업데이트를 위해 엔진을 일시 정지합니다. 관리 포지션은 재시작 후 이어서 관리합니다.")
+
+    def drain_events(self, limit: int = 200) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         for _ in range(limit):
             try:
@@ -91,343 +109,322 @@ class TradingEngine:
         except Exception:
             pass
 
-    def _on_price(self, market: str, price: float) -> None:
-        self._latest_prices[market] = price
-        now = time.monotonic()
-        last = self._last_price_ui_emit.get(market, 0.0)
-        if now - last >= 0.25:
-            self._last_price_ui_emit[market] = now
-            self.events.put({"type": "price", "market": market, "price": price})
-
-    def _restart_stream(self, markets: list[str]) -> None:
-        if self._stream:
-            self._stream.stop()
-        self._stream = MarketStream(
-            markets,
-            on_price=self._on_price,
-            on_error=lambda message: self._emit("warning", message),
-        )
-        self._stream.start()
-
     @staticmethod
     def _is_warning_market(row: dict[str, Any]) -> bool:
         event = row.get("market_event")
-        if isinstance(event, dict) and bool(event.get("warning")):
-            return True
-        return str(row.get("market_warning", "")).upper() == "CAUTION"
+        if isinstance(event, dict):
+            if bool(event.get("warning")):
+                return True
+            caution = event.get("caution")
+            if isinstance(caution, dict) and any(bool(v) for v in caution.values()):
+                return True
+            if bool(caution):
+                return True
+        warning = str(row.get("market_warning", "")).upper()
+        return warning not in ("", "NONE")
 
-    def _select_candidates(self) -> list[str]:
-        market_rows = self.client.get_markets()
-        allowed = {
-            row["market"]
-            for row in market_rows
-            if str(row.get("market", "")).startswith("KRW-")
-            and not self._is_warning_market(row)
-        }
-        tickers = self.client.get_all_krw_tickers()
-        ranked = [
-            row
-            for row in tickers
-            if row.get("market") in allowed
-            and float(row.get("acc_trade_price_24h") or 0.0)
-            >= self.config.strategy.min_24h_trade_value
-        ]
-        ranked.sort(
-            key=lambda row: float(row.get("acc_trade_price_24h") or 0.0),
-            reverse=True,
-        )
-        candidates = [str(row["market"]) for row in ranked[: self.config.strategy.candidate_count]]
-        self._emit("candidates", "후보 종목 갱신", markets=candidates)
-        return candidates
+    @staticmethod
+    def _chunks(values: list[str], size: int) -> list[list[str]]:
+        return [values[i:i + size] for i in range(0, len(values), size)]
+
+    def _refresh_markets(self) -> None:
+        rows = self.client.get_markets()
+        allowed = sorted(str(row["market"]) for row in rows if str(row.get("market", "")).startswith("KRW-") and not self._is_warning_market(row))
+        if allowed == self._allowed_markets:
+            return
+        self._allowed_markets = allowed
+        self._restart_global_streams()
+        self._emit("market_universe", f"KRW 실시간 감시 종목 {len(allowed)}개", count=len(allowed))
+
+    def _restart_global_streams(self) -> None:
+        for stream in self._global_streams:
+            stream.stop()
+        self._global_streams.clear()
+        for index, markets in enumerate(self._chunks(self._allowed_markets, 100)):
+            stream = MarketStream(markets, on_trade=self._on_trade, on_error=lambda message, idx=index: self._emit("warning", f"시장 스트림 {idx + 1}: {message}"), name=f"upbit-trades-{index + 1}")
+            stream.start()
+            self._global_streams.append(stream)
+
+    def _restart_deep_stream(self, markets: list[str]) -> None:
+        markets = list(dict.fromkeys(markets))
+        if markets == self._deep_markets:
+            return
+        if self._deep_stream:
+            self._deep_stream.stop()
+            self._deep_stream = None
+        self._deep_markets = markets
+        if markets:
+            self._deep_stream = MarketStream(markets, on_orderbook=self._on_orderbook, on_error=lambda message: self._emit("warning", f"호가 스트림: {message}"), orderbook_depth=max(5, self.config.strategy.orderbook_depth), name="upbit-orderbook-deep")
+            self._deep_stream.start()
+
+    def _on_trade(self, event: dict[str, Any]) -> None:
+        self.strategy.on_trade(event)
+        market = str(event.get("code") or "")
+        price = float(event.get("trade_price") or 0.0)
+        if not market or price <= 0:
+            return
+        self._latest_prices[market] = price
+        now = time.monotonic()
+        if now - self._last_price_ui_emit.get(market, 0.0) >= 0.25:
+            self._last_price_ui_emit[market] = now
+            self.events.put({"type": "price", "market": market, "price": price})
+
+    def _on_orderbook(self, event: dict[str, Any]) -> None:
+        self.strategy.on_orderbook(event)
 
     def _run(self) -> None:
-        next_candidate_refresh = 0.0
+        next_market_refresh = next_candidate_refresh = next_evaluation = next_portfolio = 0.0
         try:
-            while not self._stop.is_set():
+            while not self._hard_stop.is_set():
                 now = time.monotonic()
-                if now >= next_candidate_refresh or not self._candidates:
-                    self._candidates = self._select_candidates()
-                    stream_markets = list(self._candidates)
-                    if self._mode == TradingMode.LIVE:
-                        for market in sorted(self.storage.managed_markets()):
-                            if market not in stream_markets:
-                                stream_markets.append(market)
-                    elif self._paper.position and self._paper.position.market not in stream_markets:
-                        stream_markets.append(self._paper.position.market)
-                    self._restart_stream(stream_markets)
+                if now >= next_market_refresh or not self._allowed_markets:
+                    try:
+                        self._refresh_markets(); self.risk.report_api_success()
+                    except Exception as exc:
+                        self.risk.report_api_failure(); self._emit("warning", f"시장 목록 갱신 실패: {exc}")
+                    next_market_refresh = now + self.config.strategy.market_refresh_seconds
+                if now >= next_candidate_refresh:
+                    ranked = self.strategy.rank_markets(self._allowed_markets, self.config.strategy.deep_candidate_count)
+                    candidates = [market for market, _ in ranked]
+                    for market in sorted(self.storage.managed_markets()):
+                        if market not in candidates:
+                            candidates.append(market)
+                    self._restart_deep_stream(candidates)
+                    self.events.put({"type": "candidates", "markets": [m for m, _ in ranked[:12]], "scores": {m: s for m, s in ranked[:12]}})
                     next_candidate_refresh = now + self.config.strategy.candidate_refresh_seconds
-
-                self._evaluate_cycle()
-                self._publish_portfolio()
-                self._stop.wait(self.config.strategy.evaluation_seconds)
+                if now >= next_evaluation:
+                    self._evaluate_cycle(); next_evaluation = now + self.config.strategy.evaluation_seconds
+                if now >= next_portfolio:
+                    try:
+                        self._publish_portfolio()
+                    except Exception as exc:
+                        self._emit("warning", f"자산 갱신 실패: {exc}")
+                    next_portfolio = now + self.config.strategy.portfolio_publish_seconds
+                if self._state == EngineState.DRAINING and not self.storage.managed_markets():
+                    self._emit("drain_complete", "관리 포지션 청산이 완료되어 자동매매를 종료합니다.")
+                    break
+                self._hard_stop.wait(0.10)
         except Exception as exc:
             self._emit("error", f"자동매매 엔진 중단: {exc}")
         finally:
-            if self._stream:
-                self._stream.stop()
-                self._stream = None
-            self._emit("stopped", "자동매매 엔진 종료")
+            for stream in self._global_streams:
+                stream.stop()
+            self._global_streams.clear()
+            if self._deep_stream:
+                self._deep_stream.stop(); self._deep_stream = None
+            self._state = EngineState.STOPPED
+            if not self._update_shutdown:
+                self._emit("stopped", "자동매매 엔진 종료")
+
+    def _fee_info(self, market: str) -> tuple[float, float, float, float] | None:
+        cached = self._fee_cache.get(market); now = time.monotonic()
+        if cached and now - cached[0] < self.config.strategy.fee_cache_seconds:
+            return cached[1], cached[2], cached[3], cached[4]
+        try:
+            chance = self.client.get_order_chance(market)
+            bid_fee, ask_fee = float(chance.get("bid_fee") or 0.0), float(chance.get("ask_fee") or 0.0)
+            market_info = chance.get("market") or {}
+            min_bid = float((market_info.get("bid") or {}).get("min_total") or self.config.safety.min_order_krw)
+            min_ask = float((market_info.get("ask") or {}).get("min_total") or self.config.safety.min_order_krw)
+            self._fee_cache[market] = (now, bid_fee, ask_fee, min_bid, min_ask)
+            self.risk.report_api_success()
+            return bid_fee, ask_fee, min_bid, min_ask
+        except Exception as exc:
+            self.risk.report_api_failure(); self._emit("warning", f"{market} 주문 가능정보 조회 실패: {exc}"); return None
+
+    def _live_portfolio(self) -> tuple[float, float, float, list[Position]]:
+        accounts = self.client.get_accounts(); self.risk.report_api_success()
+        available_cash = total_cash = 0.0; positions: list[Position] = []
+        for row in accounts:
+            currency = str(row.get("currency", "")); balance = float(row.get("balance") or 0.0); locked = float(row.get("locked") or 0.0)
+            if currency == "KRW":
+                available_cash, total_cash = balance, balance + locked; continue
+            if balance + locked <= 0 or str(row.get("unit_currency") or "KRW") != "KRW":
+                continue
+            positions.append(Position(f"KRW-{currency}", balance, float(row.get("avg_buy_price") or 0.0), locked))
+        missing = [p.market for p in positions if not self._latest_prices.get(p.market)]
+        for chunk in self._chunks(missing, 100):
+            for row in self.client.get_tickers(chunk):
+                market, price = str(row.get("market") or ""), float(row.get("trade_price") or 0.0)
+                if market and price > 0:
+                    self._latest_prices[market] = price
+        equity = total_cash + sum(p.market_value(self._latest_prices.get(p.market, p.avg_price)) for p in positions)
+        return equity, available_cash, total_cash, positions
+
+    @staticmethod
+    def _created_elapsed(state: dict[str, Any] | None) -> float:
+        try:
+            created = datetime.fromisoformat(str((state or {}).get("created_at") or ""))
+            return max(0.0, (datetime.now() - created).total_seconds())
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _order_average_price(detail: dict[str, Any]) -> tuple[float, float, float]:
+        executed = float(detail.get("executed_volume") or 0.0); paid_fee = float(detail.get("paid_fee") or 0.0); funds = 0.0
+        for trade in detail.get("trades") or []:
+            if not isinstance(trade, dict):
+                continue
+            funds += float(trade.get("funds") or 0.0) if trade.get("funds") is not None else float(trade.get("price") or 0.0) * float(trade.get("volume") or 0.0)
+        return executed, funds / executed if executed > 0 and funds > 0 else 0.0, paid_fee
+
+    def _settle_order(self, accepted: dict[str, Any]) -> dict[str, Any]:
+        order_id = str(accepted.get("uuid") or "")
+        if not order_id:
+            return accepted
+        detail = accepted; deadline = time.monotonic() + self.config.safety.settlement_grace_seconds
+        while time.monotonic() < deadline and not self._hard_stop.is_set():
+            try:
+                detail = self.client.get_order(uuid_value=order_id); self.risk.report_api_success()
+            except Exception as exc:
+                self.risk.report_api_failure(); self._emit("warning", f"주문 {order_id} 체결조회 실패: {exc}"); time.sleep(0.25); continue
+            if str(detail.get("state") or "") in {"done", "cancel"} or float(detail.get("remaining_volume") or 0.0) <= 0:
+                break
+            time.sleep(0.20)
+        return detail
+
+    @staticmethod
+    def _simulate_buy_slippage(book: BookSnapshot, amount_krw: float) -> tuple[float, float]:
+        remaining = max(0.0, amount_krw); spent = volume = 0.0
+        for price, size in zip(book.ask_prices, book.ask_sizes):
+            take = min(remaining, price * size)
+            if take <= 0: continue
+            volume += take / price; spent += take; remaining -= take
+            if remaining <= 1e-9: break
+        if volume <= 0 or not book.ask_prices: return 0.0, 0.0
+        return max(0.0, spent / volume / book.ask_prices[0] - 1.0), spent
+
+    @staticmethod
+    def _simulate_sell_slippage(book: BookSnapshot, amount_krw: float) -> tuple[float, float]:
+        remaining = max(0.0, amount_krw); proceeds = volume = 0.0
+        for price, size in zip(book.bid_prices, book.bid_sizes):
+            take = min(remaining, price * size)
+            if take <= 0: continue
+            volume += take / price; proceeds += take; remaining -= take
+            if remaining <= 1e-9: break
+        if volume <= 0 or not book.bid_prices: return 0.0, 0.0
+        return max(0.0, 1.0 - proceeds / volume / book.bid_prices[0]), proceeds
+
+    @staticmethod
+    def _liquidity_capacity(book: BookSnapshot, *, expected_move_pct: float, bid_fee: float, ask_fee: float) -> float:
+        if not book.ask_prices: return 0.0
+        edge_room = max(0.0, expected_move_pct - bid_fee - ask_fee - book.spread_pct)
+        allowed_slippage = edge_room * 0.30; best = book.ask_prices[0]; capacity = 0.0
+        for price, size in zip(book.ask_prices, book.ask_sizes):
+            if price <= 0 or price / best - 1.0 > allowed_slippage: break
+            capacity += price * size
+        return capacity
 
     def _evaluate_cycle(self) -> None:
-        decisions: dict[str, Any] = {}
-        evaluation_markets = list(self._candidates)
-        if self._mode == TradingMode.LIVE:
-            for market in sorted(self.storage.managed_markets()):
-                if market not in evaluation_markets:
-                    evaluation_markets.append(market)
-        elif self._paper.position and self._paper.position.market not in evaluation_markets:
-            evaluation_markets.append(self._paper.position.market)
-
-        for market in evaluation_markets:
-            if self._stop.is_set():
-                return
-            try:
-                candles = self.client.get_minute_candles(
-                    market,
-                    unit=self.config.strategy.candle_unit,
-                    count=self.config.strategy.candle_count,
-                )
-                decisions[market] = self.strategy.evaluate(candles)
-            except UpbitAPIError as exc:
-                self._emit("warning", f"{market} 분석 실패: {exc}")
-            time.sleep(0.12)
-
-        if self._mode == TradingMode.PAPER:
-            self._trade_paper(decisions)
-        else:
-            self._trade_live(decisions)
-
-    def _paper_equity(self) -> float:
-        value = self._paper.cash
-        if self._paper.position:
-            price = self._latest_prices.get(
-                self._paper.position.market, self._paper.position.avg_price
-            )
-            value += self._paper.position.market_value(price)
-        return value
-
-    def _trade_paper(self, decisions: dict[str, Any]) -> None:
-        if self._stop.is_set() or self.risk.emergency:
-            return
-        position = self._paper.position
-        if position:
-            price = self._latest_prices.get(position.market)
-            if not price:
-                return
-            risk_exit = self.risk.exit_reason(avg_price=position.avg_price, current_price=price)
-            decision = decisions.get(position.market)
-            strategy_exit = bool(decision and decision.signal == Signal.SELL)
-            if risk_exit or strategy_exit:
-                reason = risk_exit or decision.reason
-                proceeds = position.quantity * price * (1.0 - self.config.risk.fee_rate)
-                quantity = position.quantity
-                self._paper.cash += proceeds
-                self._paper.position = None
-                self.storage.trade(
-                    mode=self._mode.value,
-                    market=position.market,
-                    side="SELL",
-                    quantity=quantity,
-                    amount_krw=proceeds,
-                    price=price,
-                    reason=reason,
-                )
-                self._emit("trade", f"[PAPER] {position.market} 매도: {reason}")
-            return
-
-        buys = [
-            (market, decision)
-            for market, decision in decisions.items()
-            if decision.signal == Signal.BUY
-        ]
-        if not buys:
-            return
-        market, decision = max(buys, key=lambda item: item[1].score)
-        price = self._latest_prices.get(market)
-        if not price:
-            tickers = self.client.get_tickers([market])
-            if not tickers:
-                return
-            price = float(tickers[0]["trade_price"])
-        equity = self._paper_equity()
-        check = self.risk.can_open(
-            current_equity=equity,
-            available_cash=self._paper.cash,
-            open_position_count=0,
-        )
-        if not check.allowed:
-            self._emit("risk", f"매수 차단: {check.reason}")
-            return
-
-        amount = self.config.risk.order_krw
-        fee = amount * self.config.risk.fee_rate
-        quantity = amount / price
-        self._paper.cash -= amount + fee
-        self._paper.position = Position(market, quantity, price)
-        self.storage.trade(
-            mode=self._mode.value,
-            market=market,
-            side="BUY",
-            quantity=quantity,
-            amount_krw=amount,
-            price=price,
-            reason=decision.reason,
-        )
-        self._emit("trade", f"[PAPER] {market} 매수: {decision.reason}")
-
-    def _live_portfolio(self) -> tuple[float, float, list[Position]]:
-        accounts = self.client.get_accounts()
-        cash = 0.0
-        positions: list[Position] = []
-        for row in accounts:
-            currency = str(row.get("currency", ""))
-            balance = float(row.get("balance") or 0.0)
-            locked = float(row.get("locked") or 0.0)
-            total = balance + locked
-            if currency == "KRW":
-                cash = total
-                continue
-            if total <= 0:
-                continue
-            unit = str(row.get("unit_currency") or "KRW")
-            if unit != "KRW":
-                continue
-            positions.append(
-                Position(
-                    market=f"KRW-{currency}",
-                    quantity=balance,
-                    avg_price=float(row.get("avg_buy_price") or 0.0),
-                )
-            )
-        markets = [p.market for p in positions]
-        prices = dict(self._latest_prices)
-        missing = [m for m in markets if m not in prices]
-        if missing:
-            for row in self.client.get_tickers(missing):
-                market = str(row["market"])
-                price = float(row["trade_price"])
-                prices[market] = price
-                self._latest_prices[market] = price
-        equity = cash + sum(p.market_value(prices.get(p.market, p.avg_price)) for p in positions)
-        return equity, cash, positions
-
-    def _trade_live(self, decisions: dict[str, Any]) -> None:
-        if self._stop.is_set() or self.risk.emergency:
-            return
-
+        try:
+            _, available_cash, _, positions = self._live_portfolio()
+        except UpbitAPIError as exc:
+            self.risk.report_api_failure(); self._emit("warning", f"잔고 조회 실패: {exc}"); return
+        positions_by_market = {p.market: p for p in positions}; managed = self.storage.managed_markets()
         with self._order_lock:
-            equity, cash, positions = self._live_portfolio()
-            positions_by_market = {p.market: p for p in positions}
-            managed = self.storage.managed_markets()
-
-            # Keep the managed marker even if a newly accepted buy is not visible
-            # in balances yet. This prevents a duplicate buy on the next cycle.
-            active_managed = managed & set(positions_by_market)
-
-            # Never auto-sell assets that were not opened by JunhyunBank.
-            for market in sorted(active_managed):
-                if self._stop.is_set() or self.risk.emergency:
-                    return
-                position = positions_by_market[market]
-                price = self._latest_prices.get(position.market)
-                if not price or position.quantity <= 0:
+            for market in sorted(managed):
+                if self._hard_stop.is_set() or self.risk.emergency: return
+                state = self.storage.get_managed_state(market); position = positions_by_market.get(market); elapsed = self._created_elapsed(state)
+                if position is None or position.total_quantity <= 0:
+                    if elapsed > self.config.safety.settlement_grace_seconds:
+                        self.storage.unmark_managed_position(market); self._emit("warning", f"{market} 관리표시는 있으나 잔고가 없어 관리상태를 해제했습니다.")
                     continue
-                risk_exit = self.risk.exit_reason(
-                    avg_price=position.avg_price, current_price=price
-                )
-                decision = decisions.get(position.market)
-                strategy_exit = bool(decision and decision.signal == Signal.SELL)
-                if risk_exit or strategy_exit:
-                    reason = risk_exit or decision.reason
-                    if self._stop.is_set() or self.risk.emergency:
-                        return
-                    order = self.client.place_market_sell(position.market, position.quantity)
-                    self.storage.unmark_managed_position(position.market)
-                    self.storage.trade(
-                        mode=self._mode.value,
-                        market=position.market,
-                        side="SELL",
-                        quantity=position.quantity,
-                        amount_krw=None,
-                        price=price,
-                        reason=reason,
-                        exchange_order_id=order.get("uuid"),
-                    )
-                    self._emit("trade", f"[LIVE] {position.market} 매도 주문: {reason}")
-                    return
+                managed_qty = float((state or {}).get("managed_quantity") or 0.0)
+                if managed_qty <= 0:
+                    managed_qty = position.total_quantity; self.storage.update_managed_quantity(market, managed_qty); self._emit("warning", f"{market} V1 관리 포지션 수량을 현재 잔고 기준으로 복구했습니다.")
+                current_price = self._latest_prices.get(market) or self.strategy.latest_price(market)
+                if not current_price: continue
+                entry_price = float((state or {}).get("entry_price") or position.avg_price)
+                peak = max(float((state or {}).get("peak_price") or entry_price), current_price); self.storage.update_managed_peak(market, peak)
+                fee_info = self._fee_info(market)
+                if fee_info: _, ask_fee, _, min_ask = fee_info
+                else: ask_fee, min_ask = float((state or {}).get("entry_fee_rate") or 0.0005), self.config.safety.min_order_krw
+                entry_fee = float((state or {}).get("entry_fee_rate") or ask_fee); book = self.strategy.book(market); spread = book.spread_pct if book else 0.0
+                round_trip = entry_fee + ask_fee + spread * 1.5
+                initial_risk = float((state or {}).get("initial_risk_pct") or 0.0)
+                if initial_risk <= 0:
+                    initial_risk = self.strategy.suggest_emergency_risk(market, round_trip)
+                    if initial_risk > 0: self.storage.mark_managed_position(market, initial_risk_pct=initial_risk)
+                horizon = float((state or {}).get("expected_horizon_seconds") or 300.0)
+                decision = self.strategy.evaluate_position(market, entry_price=entry_price, current_price=current_price, peak_price=peak, initial_risk_pct=initial_risk, round_trip_cost_pct=round_trip, elapsed_seconds=elapsed, expected_horizon_seconds=horizon)
+                if decision.signal == Signal.SELL:
+                    self._sell_managed(market=market, position=position, managed_qty=managed_qty, current_price=current_price, min_ask_krw=min_ask, ask_fee=ask_fee, state=state or {}, reason=decision.reason)
+            if self._state != EngineState.RUNNING or self.risk.emergency: return
+            health = self.health_governor.score(self.storage.strategy_outcomes(self.config.strategy.health_lookback)); regime_name, regime_factor = self.strategy.market_regime(self._allowed_markets)
+            self.events.put({"type": "strategy_health", "health": health, "regime": regime_name})
+            if health <= 0 or regime_factor <= 0: return
+            held = set(positions_by_market); decisions: list[tuple[str, Any, tuple[float, float, float, float]]] = []
+            for market, _ in self.strategy.rank_markets(self._deep_markets, self.config.strategy.deep_candidate_count):
+                if market in held or market in managed: continue
+                if self._state != EngineState.RUNNING or self.risk.emergency: return
+                fee_info = self._fee_info(market)
+                if not fee_info: continue
+                bid_fee, ask_fee, _, _ = fee_info
+                decision = self.strategy.evaluate_entry(market, bid_fee=bid_fee, ask_fee=ask_fee, health=health, regime_factor=regime_factor)
+                if decision.signal == Signal.BUY: decisions.append((market, decision, fee_info))
+            decisions.sort(key=lambda item: item[1].score, reverse=True); cash_remaining = available_cash
+            for market, decision, fee_info in decisions:
+                if self._state != EngineState.RUNNING or self.risk.emergency: return
+                bid_fee, ask_fee, min_bid, _ = fee_info; book = self.strategy.book(market)
+                if not book: continue
+                desired = cash_remaining * decision.capital_fraction
+                capacity = self._liquidity_capacity(book, expected_move_pct=decision.expected_move_pct, bid_fee=bid_fee, ask_fee=ask_fee)
+                amount = min(desired, capacity, cash_remaining / (1.0 + bid_fee))
+                buy_slip, fillable = self._simulate_buy_slippage(book, amount); sell_slip, _ = self._simulate_sell_slippage(book, amount); amount = min(amount, fillable)
+                actual_cost = bid_fee + ask_fee + book.spread_pct + buy_slip + sell_slip
+                if amount <= 0 or decision.expected_move_pct <= actual_cost * 2.0: continue
+                check = self.risk.can_open(available_cash=cash_remaining, amount_krw=amount, min_order_krw=min_bid, stream_age_seconds=max(self.strategy.trade_age(market), self.strategy.book_age(market)))
+                if not check.allowed:
+                    self._emit("risk", f"{market} 매수 차단: {check.reason}"); continue
+                self._buy_managed(market=market, amount_krw=amount, decision=decision, bid_fee=bid_fee, actual_round_trip_cost=actual_cost)
+                cash_remaining = max(0.0, cash_remaining - amount * (1.0 + bid_fee))
 
-            held = set(positions_by_market)
-            buys = [
-                (market, decision)
-                for market, decision in decisions.items()
-                if decision.signal == Signal.BUY and market not in held and market not in managed
-            ]
-            if not buys:
-                return
-            market, decision = max(buys, key=lambda item: item[1].score)
-            check = self.risk.can_open(
-                current_equity=equity,
-                available_cash=cash,
-                open_position_count=len(managed),
-            )
-            if not check.allowed:
-                self._emit("risk", f"매수 차단: {check.reason}")
-                return
-            if self._stop.is_set() or self.risk.emergency:
-                return
-            order = self.client.place_market_buy(market, self.config.risk.order_krw)
-            self.storage.mark_managed_position(market)
-            self.storage.trade(
-                mode=self._mode.value,
-                market=market,
-                side="BUY",
-                quantity=None,
-                amount_krw=self.config.risk.order_krw,
-                price=self._latest_prices.get(market),
-                reason=decision.reason,
-                exchange_order_id=order.get("uuid"),
-            )
-            self._emit("trade", f"[LIVE] {market} 매수 주문: {decision.reason}")
+    def _buy_managed(self, *, market: str, amount_krw: float, decision: Any, bid_fee: float, actual_round_trip_cost: float) -> None:
+        if self._state != EngineState.RUNNING or self.risk.emergency: return
+        try:
+            accepted = self.client.place_best_ioc_buy(market, amount_krw); self.risk.report_api_success()
+        except Exception as exc:
+            self.risk.report_api_failure(); self._emit("error", f"{market} 매수 주문 실패: {exc}"); return
+        self.storage.mark_managed_position(market, entry_amount_krw=amount_krw, entry_fee_rate=bid_fee, initial_risk_pct=decision.initial_risk_pct, entry_score=decision.score, signal_kind=decision.kind.value, expected_horizon_seconds=decision.expected_horizon_seconds, managed_quantity=0.0)
+        detail = self._settle_order(accepted); executed, avg_price, paid_fee = self._order_average_price(detail)
+        if executed <= 0:
+            if str(detail.get("state") or "") in {"cancel", "done"}: self.storage.unmark_managed_position(market)
+            self._emit("trade", f"{market} 매수 IOC 미체결"); return
+        avg_price = avg_price or self._latest_prices.get(market) or 0.0
+        self.storage.mark_managed_position(market, entry_price=avg_price, entry_amount_krw=amount_krw, entry_fee_rate=bid_fee, initial_risk_pct=max(decision.initial_risk_pct, actual_round_trip_cost * 1.8), entry_score=decision.score, signal_kind=decision.kind.value, peak_price=avg_price, expected_horizon_seconds=decision.expected_horizon_seconds, managed_quantity=executed)
+        self.storage.trade(mode="LIVE", market=market, side="BUY", quantity=executed, amount_krw=amount_krw, price=avg_price, reason=decision.reason, exchange_order_id=detail.get("uuid") or accepted.get("uuid"))
+        self._emit("trade", f"[LIVE] {market} 매수 체결 {executed:.8f} @ {avg_price:,.4f}", market=market, side="BUY", fee=paid_fee)
+
+    def _sell_managed(self, *, market: str, position: Position, managed_qty: float, current_price: float, min_ask_krw: float, ask_fee: float, state: dict[str, Any], reason: str) -> None:
+        available = min(max(0.0, managed_qty), max(0.0, position.quantity))
+        if available <= 0: return
+        if available * current_price < min_ask_krw:
+            self.storage.unmark_managed_position(market); self.strategy.notify_exit(market); self._emit("warning", f"{market} 잔여 관리수량이 최소 주문금액 미만이라 자동관리에서 해제합니다."); return
+        try:
+            accepted = self.client.place_best_ioc_sell(market, available); self.risk.report_api_success(); detail = self._settle_order(accepted)
+        except Exception as exc:
+            self.risk.report_api_failure(); self._emit("error", f"{market} 매도 주문 실패: {exc}"); return
+        executed, avg_price, paid_fee = self._order_average_price(detail)
+        if executed <= 0 and reason.startswith("Emergency Stop"):
+            try:
+                accepted = self.client.place_market_sell(market, available); detail = self._settle_order(accepted); executed, avg_price, paid_fee = self._order_average_price(detail)
+            except Exception as exc:
+                self.risk.report_api_failure(); self._emit("error", f"{market} 긴급 시장가 매도 실패: {exc}"); return
+        if executed <= 0: return
+        avg_price = avg_price or current_price; remaining = max(0.0, managed_qty - executed); self.storage.update_managed_quantity(market, remaining)
+        self.storage.trade(mode="LIVE", market=market, side="SELL", quantity=executed, amount_krw=executed * avg_price, price=avg_price, reason=reason, exchange_order_id=detail.get("uuid") or accepted.get("uuid"))
+        self._emit("trade", f"[LIVE] {market} 매도 체결 {executed:.8f} @ {avg_price:,.4f}: {reason}", market=market, side="SELL", fee=paid_fee)
+        if remaining * avg_price < max(min_ask_krw, self.config.safety.min_order_krw):
+            entry_price = float(state.get("entry_price") or position.avg_price); entry_fee = float(state.get("entry_fee_rate") or 0.0); initial_risk = max(float(state.get("initial_risk_pct") or 0.0), 1e-6)
+            gross = avg_price / entry_price - 1.0 if entry_price > 0 else 0.0; net = gross - entry_fee - ask_fee
+            self.storage.record_outcome(market=market, signal_kind=state.get("signal_kind"), net_return_pct=net, normalized_return=net / initial_risk)
+            self.storage.unmark_managed_position(market); self.strategy.notify_exit(market)
 
     def _publish_portfolio(self) -> None:
-        if self._mode == TradingMode.PAPER:
-            position = self._paper.position
-            rows = []
-            if position:
-                price = self._latest_prices.get(position.market, position.avg_price)
-                rows.append(
-                    {
-                        "market": position.market,
-                        "quantity": position.quantity,
-                        "avg_price": position.avg_price,
-                        "current_price": price,
-                        "value": position.market_value(price),
-                    }
-                )
-            equity = self._paper_equity()
-            cash = self._paper.cash
-        else:
-            equity, cash, positions = self._live_portfolio()
-            rows = []
-            for position in positions:
-                price = self._latest_prices.get(position.market, position.avg_price)
-                rows.append(
-                    {
-                        "market": position.market,
-                        "quantity": position.quantity,
-                        "avg_price": position.avg_price,
-                        "current_price": price,
-                        "value": position.market_value(price),
-                    }
-                )
-        start = self.risk.daily_start_equity or equity
-        pnl_pct = (equity / start - 1.0) * 100.0 if start else 0.0
-        self.events.put(
-            {
-                "type": "portfolio",
-                "equity": equity,
-                "cash": cash,
-                "pnl_pct": pnl_pct,
-                "positions": rows,
-            }
-        )
+        equity, available_cash, total_cash, positions = self._live_portfolio(); managed = self.storage.managed_markets()
+        rows: list[dict[str, Any]] = [{"market": "KRW", "quantity": total_cash, "avg_price": 1.0, "current_price": 1.0, "value": total_cash, "managed": False}]
+        for position in positions:
+            price = self._latest_prices.get(position.market, position.avg_price)
+            rows.append({"market": position.market, "quantity": position.total_quantity, "avg_price": position.avg_price, "current_price": price, "value": position.market_value(price), "managed": position.market in managed})
+        start = self._session_start_equity or equity; pnl_pct = (equity / start - 1.0) * 100.0 if start else 0.0
+        self.events.put({"type": "portfolio", "equity": equity, "cash": total_cash, "available_cash": available_cash, "pnl_pct": pnl_pct, "positions": rows})
