@@ -100,7 +100,7 @@ class MicroFlowStrategy:
         self._book_history: dict[str, deque[tuple[int, float, float]]] = defaultdict(
             lambda: deque(maxlen=maxlen)
         )
-        self._weak_counts: dict[str, int] = defaultdict(int)
+        self._weak_evidence: dict[str, tuple[float, int, int, int, float]] = {}
         self._last_trade_received: dict[str, float] = {}
         self._blocked_after_exit: set[str] = set()
 
@@ -585,28 +585,30 @@ class MicroFlowStrategy:
                 Signal.SELL, 0.0, f"Emergency Stop {pnl:+.2%}"
             )
         if not f:
+            self._weak_evidence.pop(market, None)
             return StrategyDecision(
                 Signal.HOLD, 0.0, "시장 데이터 워밍업/복구 중"
             )
 
-        parts = [
-            max(1e-6, f["activity_q"]),
-            max(1e-6, f["aggression_q"]),
-            max(1e-6, f["book_q"]),
-            max(1e-6, f["momentum_q"]),
-        ]
-        hold = math.prod(parts) ** 0.25
-        if hold < 0.36 or (f["aggression"] < 0 and f["imbalance"] < 0):
-            self._weak_counts[market] += 1
-        else:
-            self._weak_counts[market] = 0
-        if self._weak_counts[market] >= 2:
-            return StrategyDecision(
-                Signal.SELL,
-                hold * 100.0,
-                f"수급 약화: HoldQ={hold:.3f}",
-                hold_quality=hold,
-            )
+        # Entry scores measure an unusual *acceleration*. A pause in that
+        # acceleration is not evidence of an adverse move. In particular,
+        # book_q collapses when a still-positive imbalance stops increasing.
+        # Holding therefore uses signed flow, signed depth and price support,
+        # not entry percentiles or their geometric product.
+        noise = max(f['spread_pct'], f['realized_30s'] * 0.25,
+                    round_trip_cost_pct * 0.25, 1e-6)
+        flow_support = _clamp((f['aggression'] + 1.0) / 2.0)
+        book_support = _clamp((f['imbalance'] + 1.0) / 2.0)
+        price_support = 0.5 + 0.5 * math.tanh(f['short_return'] / noise)
+        hold = 0.4 * flow_support + 0.3 * book_support + 0.3 * price_support
+
+        # Never accumulate weak observations while data is absent/stale.
+        # The price-based emergency stop above remains unconditional.
+        if self.trade_age(market) > 3.0:
+            self._weak_evidence.pop(market, None)
+            return StrategyDecision(Signal.HOLD, hold * 100.0,
+                                    '보유 관측 대기: 체결 지연 · 수급 청산 확인 초기화',
+                                    hold_quality=hold)
 
         peak = max(peak_price, current_price, entry_price)
         mfe = peak / entry_price - 1.0
@@ -624,11 +626,43 @@ class MicroFlowStrategy:
                     hold_quality=hold,
                 )
 
+        if self.book_age(market) > 3.0:
+            self._weak_evidence.pop(market, None)
+            return StrategyDecision(Signal.HOLD, hold * 100.0,
+                                    '보유 관측 대기: 호가 지연 · 수급 청산 확인 초기화',
+                                    hold_quality=hold)
+
+        deadband = max(0.0, self.config.exit_pressure_deadband)
+        adverse = [f['aggression'] < -deadband,
+                   f['imbalance'] < -deadband,
+                   f['short_return'] < -noise]
+        confirmations = 0
+        if sum(adverse) >= 2:
+            trade_second = self._current[market].second if market in self._current else -1
+            books = self._book_history.get(market)
+            book_second = books[-1][0] if books else -1
+            evidence = self._weak_evidence.get(market)
+            new_observation = False
+            if evidence is None or elapsed_seconds < evidence[0] or elapsed_seconds - evidence[4] > 3.0:
+                evidence = (elapsed_seconds, trade_second, book_second, 1, elapsed_seconds)
+            elif trade_second > evidence[1] and book_second > evidence[2]:
+                evidence = (evidence[0], trade_second, book_second, evidence[3] + 1, elapsed_seconds)
+                new_observation = True
+            self._weak_evidence[market] = evidence
+            confirmations = evidence[3]
+            if (new_observation and trade_second >= 0 and book_second >= 0 and confirmations >= 3
+                    and elapsed_seconds - evidence[0] >= self.config.exit_confirmation_seconds):
+                return StrategyDecision(Signal.SELL, hold * 100.0,
+                                        f'지속 수급 반전: 지표 {sum(adverse)}/3 · 독립 관측 {confirmations}회 · HoldQ={hold:.3f}',
+                                        hold_quality=hold)
+        else:
+            self._weak_evidence.pop(market, None)
+
         if (
             expected_horizon_seconds > 0
             and elapsed_seconds > expected_horizon_seconds * 1.5
             and mfe < round_trip_cost_pct * 1.5
-            and hold < 0.60
+            and (hold < 0.60 or f['short_return'] <= 0)
         ):
             return StrategyDecision(
                 Signal.SELL,
@@ -639,16 +673,17 @@ class MicroFlowStrategy:
         return StrategyDecision(
             Signal.HOLD,
             hold * 100.0,
-            f"보유 유지: HoldQ={hold:.3f}",
+            f"보유 유지: HoldQ={hold:.3f} · 반전 지표 {sum(adverse)}/3 · 확인 {confirmations}회",
             hold_quality=hold,
         )
 
     @synchronized
     def notify_exit(self, market: str) -> None:
         self._blocked_after_exit.add(market)
-        self._weak_counts.pop(market, None)
+        self._weak_evidence.pop(market, None)
 
     @synchronized
     def reset_orderbook(self, market: str) -> None:
         self._books.pop(market, None)
         self._book_history.pop(market, None)
+        self._weak_evidence.pop(market, None)

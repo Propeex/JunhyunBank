@@ -36,6 +36,8 @@ class StrategyConfig:
     pullback_quality: float = 0.76
     fee_cache_seconds: float = 3_600.0
     health_lookback: int = 50
+    exit_confirmation_seconds: float = 5.0
+    exit_pressure_deadband: float = 0.10
 
 
 @dataclass(slots=True)
