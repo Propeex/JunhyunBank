@@ -1,3 +1,17 @@
+# V4.0.5 — Deterministic strategy replay
+
+- V4.0.4 recorder session을 네트워크와 실제 주문 없이 재생하는 `scripts/replay_strategy.py` 추가.
+- recorder의 `received_monotonic_ns`를 기준으로 logical replay clock을 구성해 실행 PC 속도와 wall clock에 영향을 받지 않는 freshness 판정을 지원.
+- 여러 WebSocket callback의 수신시각이 파일 순서에서 소폭 역전되면 시간을 뒤로 돌리지 않고 clamp하고 `clock_retrograde_events`로 진단.
+- production `MicroFlowStrategy`의 threshold/자금배분 코드는 변경하지 않고 replay 전용 subclass에서 trade/orderbook local receive freshness만 대체.
+- `session_start`에 저장된 당시 안전 KRW universe와 `StrategyConfig`를 복원하고 한 입력에 여러 session이 섞이면 fail-closed.
+- recorded orderbook 이벤트마다 종목별 cadence로 현재 entry decision/feature/regime/top-of-book 상태를 재생.
+- 동일 recording + 동일 전략 코드/config/fee에서 동일해야 하는 canonical decision SHA-256 fingerprint 추가.
+- 비정상 종료 recording은 조사할 수 있으나 complete session이 아니면 CLI가 nonzero exit code를 반환.
+- depth execution/partial fill/latency/portfolio PnL simulation은 아직 포함하지 않으며 수익성 검증으로 간주하지 않음.
+- 실거래 engine/execution/managed quantity/전략 threshold는 변경하지 않음.
+- 상세 설계: [V4.0.5 Deterministic Strategy Replay](docs/V4_0_5_DETERMINISTIC_REPLAY.md).
+
 # V4.0.4 — Raw market data recorder
 
 - API Key와 주문 API를 사용하지 않는 `scripts/record_public_market.py` 추가.
