@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "junhyunbank"
-version = "4.0.6"
+version = "4.0.7"
 description = "Live-only adaptive Upbit microstructure trading desktop application"
 readme = "README.md"
 requires-python = ">=3.11"

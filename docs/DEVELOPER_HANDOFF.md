@@ -1,8 +1,8 @@
-# JunhyunBank 개발 인수인계 — V4.0.6 기준
+# JunhyunBank 개발 인수인계 — V4.0.7 기준
 
 이 문서는 이전 대화가 없어도 새 개발자 또는 새 ChatGPT가 제품 의도, 안전 불변조건, 현재 구현과 다음 작업을 바로 이어가기 위한 최우선 인수인계 문서다.
 
-코드와 문서가 충돌하면 **현재 `main` 코드가 source of truth**다. 주문/복구는 `V4_AUDIT.md`, 업데이트는 `V4_0_1_UPDATE_RECOVERY.md`, Private reconciliation은 `V4_0_2_PRIVATE_RECONCILIATION.md`, 전략 검증 계보는 V4.0.3~V4.0.6 문서를 함께 읽는다.
+코드와 문서가 충돌하면 **현재 `main` 코드가 source of truth**다. 주문/복구는 `V4_AUDIT.md`, 업데이트는 `V4_0_1_UPDATE_RECOVERY.md`, Private reconciliation은 `V4_0_2_PRIVATE_RECONCILIATION.md`, 전략 검증 계보는 V4.0.3~V4.0.7 문서를 함께 읽는다.
 
 ## 1. 제품 정의
 
@@ -42,6 +42,7 @@ PAPER 모드는 V2부터 제거됐다. 앱 `시작`은 실제 주문을 허용�
 14. 업데이트는 새 EXE/DB 사전검증 성공 뒤에만 정상 재개하고 실패하면 EXE+DB snapshot을 함께 rollback한다.
 15. 거래가 적다는 이유로 전략 threshold나 비용 gate를 임의 완화하지 않는다. recorder/OOS 근거가 먼저다.
 16. 현재 일반 주문은 **Upbit Best+IOC**이며, 이를 generic market depth-walk 주문처럼 모델링하지 않는다.
+17. scanner 후보가 실제 entry freshness gate를 이미 통과할 수 없다면 scarce deep-entry 슬롯을 장시간 점유시키지 않는다. 단, managed position의 exit monitoring은 freshness 때문에 제거하지 않는다.
 
 ## 4. V4 버전 계보
 
@@ -104,6 +105,18 @@ PAPER 모드는 V2부터 제거됐다. 앱 `시작`은 실제 주문을 허용�
 - `main.py`는 `live_engine.TradingEngine`을 실제 production engine으로 사용.
 - 주문 타입 자체와 JH-MicroFlow threshold/ExpectedMove/managed quantity/durable reconciliation은 변경하지 않음.
 
+### V4.0.7
+
+- V4.0.0 실사용 캡처에서 확인된 `후보는 있으나 대부분 체결/호가 3초 이상 지연` 형태의 candidate starvation을 재현·보완.
+- scanner HotScore freshness 허용폭과 실제 LIVE entry stale gate(기본 3초)의 불일치를 production 후보선정에서 정렬.
+- scanner 상위 목록의 stale 비관리 후보를 deep 선정 전에 제외.
+- 빈 자리는 top-N 밖의 fresh/warmed 시장을 HotScore 순으로 보충.
+- stale 비관리 후보는 30초 deep minimum residency보다 freshness를 우선하여 즉시 퇴출.
+- managed position은 stale이어도 exit monitoring을 위해 deep set에 유지.
+- GUI 후보 목록과 runtime candidate count를 실제 fresh actionable ranking과 정렬.
+- 5분 이상 fresh actionable 후보가 없으면 stale 제외 수를 포함한 별도 진단 경고.
+- `ignition_quality`, `pullback_quality`, ExpectedMove 비용 gate, Strategy Health, Market Regime은 완화하지 않음.
+
 ## 5. 핵심 소스 구조
 
 | 파일 | 역할 |
@@ -112,7 +125,7 @@ PAPER 모드는 V2부터 제거됐다. 앱 `시작`은 실제 주문을 허용�
 | `ui.py` | PySide6 UI와 사용자 동작 |
 | `engine.py` | 기본 거래 lifecycle, portfolio/주문 호출; 과거 generic helper도 남아 있으므로 production semantics는 `live_engine`/`execution_model` 확인 |
 | `runtime_engine.py` | market discovery, persistent deep stream, Private stream lifecycle |
-| `live_engine.py` | V4.0.6 production Best+IOC pre-trade semantics override |
+| `live_engine.py` | V4.0.6 Best+IOC pre-trade semantics + V4.0.7 fresh actionable candidate/deep-slot selection |
 | `execution_model.py` | Best+IOC top-level capacity/fill pure model; 이후 simulator도 재사용 |
 | `execution.py` | durable order intent, submit/reconcile/fill 적용 |
 | `strategy.py` | JH-MicroFlow feature/HotScore/entry/exit |
@@ -200,18 +213,19 @@ PR과 `main`에서 Windows + Ubuntu pytest와 실제 Upbit Public REST/WebSocket
 
 mock/synthetic exchange에서 timeout, 5xx, 429, partial IOC, nonterminal order, restart recovery, manual holdings 보호, Private event wake-up을 회귀검증한다. 자동 CI는 실제 자금 주문을 하지 않는다.
 
-### 전략 연구
+### 전략 연구/파이프라인
 
 - V4.0.3: forward top-of-book label.
 - V4.0.4: raw Public trade/L2 capture.
 - V4.0.5: deterministic decision replay.
 - V4.0.6: current live Best+IOC execution semantics 정합화.
+- V4.0.7: scanner → deep entry 경로를 actual entry freshness와 정렬해 stale-slot starvation 방지.
 
 아직 수익성 확정이 아니다. latency-aware fill simulation과 충분한 장기간 purged OOS가 남아 있다.
 
 ## 10. 다음 개발 우선순위
 
-1. **V4.0.7 Best+IOC Execution Simulator**
+1. **V4.0.8 Best+IOC Execution Simulator**
    - deterministic replay decision timestamp에서 configurable latency 적용.
    - latency 후 첫 유효 orderbook을 주문 접수시점 book으로 선택.
    - current best opposing price/size만 사용해 full/partial/no-fill.
@@ -242,6 +256,7 @@ mock/synthetic exchange에서 timeout, 5xx, 429, partial IOC, nonterminal order,
 - 새 EXE health 확인 전 old executable 삭제.
 - Private account event 미사용.
 - **Best+IOC를 multi-level depth-walk로 모델링하던 오류.**
+- **stale high-HotScore 후보를 deep minimum residency로 붙잡아 fresh lower-rank 후보를 굶기던 오류.**
 
 관련 회귀테스트를 삭제하거나 단순화하지 않는다.
 
@@ -252,6 +267,7 @@ mock/synthetic exchange에서 timeout, 5xx, 429, partial IOC, nonterminal order,
 - 한 데이터 구간에서 threshold를 최적화하고 같은 구간 결과를 OOS라고 하지 않는다.
 - random shuffle 시계열 split을 하지 않는다.
 - Best+IOC current execution을 generic market depth walk로 시뮬레이션하지 않는다.
+- stale scanner 후보를 실제 entry candidate와 같은 것으로 표시하거나 scarce deep slot에 오래 유지하지 않는다.
 - Private WS만 보고 체결 회계를 확정하지 않는다.
 - balance 변화만으로 managed quantity를 재구성하지 않는다.
 - pending order를 자동 삭제/재제출하지 않는다.

@@ -1,8 +1,20 @@
-# JunhyunBank V4.0.6
+# JunhyunBank V4.0.7
 
 Upbit KRW 마켓을 24시간 감시하고 체결·호가 기반 단기 수급 신호로 실제 원화 주문을 수행하는 **Windows LIVE 전용** 자동매매 프로그램입니다.
 
 > `시작` 버튼은 실제 주문을 허용합니다. PAPER 모드는 V2부터 제거됐습니다. API Key에는 출금 권한을 부여하지 마세요.
+
+## V4.0.7 — 신선 후보 우선 진입 파이프라인
+
+V4.0.7은 V4.0.0 실사용에서 보였던 **후보는 많이 잡히는데 종목별 진입 진단이 `체결/호가 수신 대기 또는 3초 이상 지연`으로 반복되는 현상**을 재발 방지합니다.
+
+기존 scanner의 HotScore 신선도 허용폭은 실제 LIVE 신규매수 stale gate(기본 3초)보다 넓었습니다. 그래서 몇 초 전에 강한 수급이 있었던 시장이 높은 HotScore로 상위 후보와 deep orderbook 슬롯을 차지하면서도, 실제 진입평가에서는 이미 stale로 탈락할 수 있었습니다. 30초 minimum deep residency까지 겹치면 더 아래 순위의 방금 체결된 fresh 시장이 정밀분석 기회를 얻지 못하는 candidate starvation이 생길 수 있었습니다.
+
+V4.0.7은 stale 비관리 후보를 deep 선정 전에 제거하고, top-N 밖의 fresh/warmed 시장을 HotScore 순으로 보충합니다. stale 후보는 30초 residency보다 신선도 조건을 우선해 퇴출하지만, **이미 JunhyunBank가 관리하는 포지션은 청산 감시를 위해 예외적으로 deep monitoring에 계속 유지**합니다. 화면 후보와 runtime candidate count도 실제 fresh actionable 후보에 맞춥니다.
+
+이 변경은 아무 코인이나 사게 만드는 것이 아닙니다. IGNITION/PULLBACK 품질, ExpectedMove 대비 비용 gate, Strategy Health, Market Regime, stale 주문차단은 그대로입니다. 즉 **매수 심사 자체에 도달할 수 없는 stale 후보가 슬롯을 독점하는 문제만 제거**합니다.
+
+상세: **[V4.0.7 Fresh Candidate Pipeline](docs/V4_0_7_FRESH_CANDIDATE_PIPELINE.md)**
 
 ## V4.0.6 — Best+IOC 실행 모델 정합화
 
@@ -124,7 +136,9 @@ Public smoke, forward-edge validator, raw recorder는 실제 Upbit Public API만
 
 ## 검증 상태와 다음 단계
 
-코드/실서버 연결 테스트 성공은 수익성 검증을 뜻하지 않습니다. V4.0.3 forward label, V4.0.4 raw recorder, V4.0.5 deterministic replay, V4.0.6 live Best+IOC semantics 정합화로 **측정 → 저장 → 동일 경로 재현 → 실제 주문 의미 정렬**까지 진행했습니다.
+코드/실서버 연결 테스트 성공은 수익성 검증을 뜻하지 않습니다. V4.0.3 forward label, V4.0.4 raw recorder, V4.0.5 deterministic replay, V4.0.6 live Best+IOC semantics 정합화, V4.0.7 fresh candidate pipeline으로 **측정 → 저장 → 동일 경로 재현 → 실제 주문 의미 정렬 → 실제 심사 가능한 후보 공급**까지 진행했습니다.
+
+V4.0.7 이후에도 fresh actionable 후보가 꾸준히 존재하지만 오랜 시간 모든 후보가 `예상 움직임이 거래비용 대비 부족` 또는 품질 기준에서만 탈락한다면, 그때는 pipeline 문제가 아니라 전략 threshold/ExpectedMove의 실효성 문제입니다. 다음 execution simulator와 purged walk-forward/stress에서 이를 검증하고, 충분한 OOS 근거가 있을 때만 조건을 조정합니다.
 
 다음 execution simulator는 generic multi-level market depth walk가 아니라 **latency 후의 실제 Best+IOC top-level full/partial/no-fill + remainder cancel**을 재현해야 합니다. 그 위에 purged walk-forward/stress를 구축하고, 충분한 여러 시장상태 OOS가 쌓인 뒤에만 Conditional ExpectedMove와 uncertainty-aware sizing을 현재 proxy와 비교합니다.
 
@@ -141,6 +155,7 @@ Public smoke, forward-edge validator, raw recorder는 실제 Upbit Public API만
 - [`docs/V4_0_4_MARKET_RECORDER.md`](docs/V4_0_4_MARKET_RECORDER.md)
 - [`docs/V4_0_5_DETERMINISTIC_REPLAY.md`](docs/V4_0_5_DETERMINISTIC_REPLAY.md)
 - [`docs/V4_0_6_BEST_IOC_EXECUTION_MODEL.md`](docs/V4_0_6_BEST_IOC_EXECUTION_MODEL.md)
+- [`docs/V4_0_7_FRESH_CANDIDATE_PIPELINE.md`](docs/V4_0_7_FRESH_CANDIDATE_PIPELINE.md)
 - [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md)
 - [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md)
 - [`docs/UPBIT_INTEGRATION.md`](docs/UPBIT_INTEGRATION.md)

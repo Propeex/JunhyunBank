@@ -1,3 +1,15 @@
+# V4.0.7 — 신선 후보 우선 진입 파이프라인
+
+- V4.0.0 실사용에서 반복됐던 `후보는 존재하지만 체결/호가 수신 대기 또는 3초 이상 지연` 상태의 구조적 원인을 보완.
+- scanner HotScore 상위 목록과 실제 신규매수 stale gate(`market_data_stale_seconds`, 기본 3초)를 정렬해, 이미 진입 불가능한 stale 후보가 deep orderbook 슬롯을 차지하지 않도록 수정.
+- top-N 안의 stale 후보를 제거한 뒤 top-N 밖의 fresh/warmed 시장을 HotScore 순으로 보충해 실제 심사 가능한 후보 수를 유지.
+- 비관리 stale 후보는 기존 deep minimum residency보다 신선도 안전조건을 우선해 즉시 deep set에서 제외.
+- JunhyunBank managed position은 stale 여부와 관계없이 deep monitoring에 남겨 청산 안전성을 유지.
+- UI 후보 목록과 runtime candidate count를 실제 fresh actionable 후보 기준으로 맞춤.
+- 5분 이상 actionable fresh 후보가 0개면 stale 후보 제거 수를 포함한 별도 진단 경고를 출력.
+- IGNITION/PULLBACK 품질, ExpectedMove 비용 gate, Strategy Health, Market Regime, Best+IOC 주문 방식은 완화하지 않음.
+- 회귀테스트로 stale 고득점 후보가 fresh lower-rank 후보를 굶기지 않는지, stale managed position이 유지되는지, UI 후보 이벤트가 actionable set과 일치하는지 검증.
+
 # V4.0.6 — Upbit Best+IOC 실행 모델 정합화
 
 - Upbit 공식 `best` 주문이 접수 시점 상대 최우선호가를 가격으로 쓰는 지정가이며 IOC remainder는 취소된다는 사양에 live pre-trade model을 맞춤.
@@ -66,7 +78,7 @@
 # V4.0.1 — 업데이트 사전검증·원자 롤백
 
 - 새 EXE를 정상 실행하기 전에 `--post-update-verify` 비거래 검증 모드로 현재 DB 스키마와 SQLite 무결성을 확인.
-- 검증 전 현재 EXE와 SQLite DB/WAL/SHM을 snapshot으로 보존.
+- 검증 전 현재 EXE + SQLite DB/WAL/SHM을 snapshot으로 보존.
 - 새 바이너리가 token/version health marker를 만들지 못하면 이전 EXE와 업데이트 직전 DB를 함께 복원.
 - 새 버전 검증이 완료되기 전에는 LIVE 자동매매 자동 재개 금지.
 - rollback으로 복구된 이전 버전은 자동매매를 자동 재개하지 않도록 fail-safe 처리.
