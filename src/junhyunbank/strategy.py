@@ -335,6 +335,20 @@ class MicroFlowStrategy:
                     for idx in range(3, len(history) - 1)
                 ]
             dq = _percentile_rank(dh, delta) if delta > 0 else 0.0
+            # Stable, historically strong buying pressure is still confirmation.
+            # Require ten seconds of fresh, positive book observations, with no
+            # net deterioration; a single snapshot or a weakening book cannot qualify.
+            recent = [row for row in history if history and row[0] >= history[-1][0] - 10]
+            sustained = (
+                len(recent) >= 8
+                and recent[-1][0] - recent[0][0] >= 10
+                and all(0 < b and 0 < m for _, b, m in recent)
+                and all(0 < b[0] - a[0] <= 2 for a, b in zip(recent, recent[1:]))
+                and recent[-1][1] >= recent[0][1]
+                and delta >= 0
+            )
+            if sustained:
+                dq = max(dq, min(iq, mq))
             book_q = (
                 max(1e-6, iq) * max(1e-6, mq) * max(1e-6, dq)
             ) ** (1.0 / 3.0)

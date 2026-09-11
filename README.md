@@ -167,3 +167,6 @@ V4.0.7 이후에도 fresh actionable 후보가 꾸준히 존재하지만 오랜 
 - [`docs/UPBIT_INTEGRATION.md`](docs/UPBIT_INTEGRATION.md)
 
 코드와 문서가 충돌하면 현재 `main` 코드가 source of truth입니다.
+# V4.2.0 업데이트
+
+지속적인 매수 우위가 증가를 멈췄다는 이유만으로 진입 점수가 사라지던 조건을 보완했습니다. 차트는 종목 고정 선택, 실제 시간축, 5분·15분·1시간 구간, 보유 평균단가를 지원합니다. 원화 대기 상태와 매수를 막은 비용·시세 조건을 구분해 보여줍니다. [정책·검증·한계](docs/V4_2_ENTRY_AND_CHART.md)

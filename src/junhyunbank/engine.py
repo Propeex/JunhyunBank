@@ -258,7 +258,8 @@ class TradingEngine(OrderExecution):
         now = time.monotonic()
         if now - self._last_price_ui_emit.get(market, 0.0) >= 0.25:
             self._last_price_ui_emit[market] = now
-            self.events.put({"type": "price", "market": market, "price": price})
+            self.events.put({"type": "price", "market": market, "price": price,
+                             "timestamp": float(event.get("trade_timestamp") or event.get("timestamp") or time.time() * 1000) / 1000.0})
 
     def _on_orderbook(self, event: dict[str, Any]) -> None:
         self.strategy.on_orderbook(event)
@@ -526,7 +527,9 @@ class TradingEngine(OrderExecution):
                     self._entry_status(market, '이미 보유 중 · 추가 매수 제외'); continue
                 if self._state != EngineState.RUNNING or self.risk.emergency: return
                 if max(self.strategy.trade_age(market), self.strategy.book_age(market)) > self.config.safety.market_data_stale_seconds:
-                    self._entry_status(market, '체결/호가 수신 대기 또는 3초 이상 지연'); continue
+                    self._entry_status(market, '체결/호가 수신 대기 또는 3초 이상 지연',
+                                       trade_age=self._finite_age(self.strategy.trade_age(market)),
+                                       book_age=self._finite_age(self.strategy.book_age(market))); continue
                 fee_info = self._fee_info(market)
                 if not fee_info: continue
                 bid_fee, ask_fee, _, _ = fee_info
