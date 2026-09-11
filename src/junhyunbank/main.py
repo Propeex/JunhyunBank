@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .config import AppConfig
 from .instance_guard import InstanceGuard
-from .runtime_engine import TradingEngine
+from .live_engine import TradingEngine
 from .security import KeyStore
 from .ui import ApiKeyDialog, MainWindow
 from .upbit import UpbitClient

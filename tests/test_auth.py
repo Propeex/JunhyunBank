@@ -71,3 +71,51 @@ def test_get_markets_uses_current_details_response_without_second_call():
 
     assert rows[0]["market"] == "KRW-BTC"
     assert calls == [{"is_details": "true"}]
+
+
+def test_live_buy_order_remains_best_ioc_not_market_or_depth_walking_limit():
+    client = UpbitClient("access", "secret")
+    calls = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"uuid": "order-1"}
+
+    client._request = fake_request
+    try:
+        client.place_best_ioc_buy("KRW-BTC", 12345, identifier="junhyunbank-test-buy")
+    finally:
+        client.close()
+
+    method, path, kwargs = calls[0]
+    body = kwargs["json_body"]
+    assert (method, path) == ("POST", "/v1/orders")
+    assert body["side"] == "bid"
+    assert body["ord_type"] == "best"
+    assert body["time_in_force"] == "ioc"
+    assert body["price"] == "12345"
+    assert "volume" not in body
+
+
+def test_live_sell_order_remains_best_ioc():
+    client = UpbitClient("access", "secret")
+    calls = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"uuid": "order-2"}
+
+    client._request = fake_request
+    try:
+        client.place_best_ioc_sell("KRW-BTC", 0.123, identifier="junhyunbank-test-sell")
+    finally:
+        client.close()
+
+    method, path, kwargs = calls[0]
+    body = kwargs["json_body"]
+    assert (method, path) == ("POST", "/v1/orders")
+    assert body["side"] == "ask"
+    assert body["ord_type"] == "best"
+    assert body["time_in_force"] == "ioc"
+    assert body["volume"] == "0.123"
+    assert "price" not in body
