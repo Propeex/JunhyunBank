@@ -88,6 +88,7 @@ class MainWindow(QMainWindow):
         self.chart_title = QLabel('KRW-BTC · 가격 수신 대기')
         self.chart = pg.PlotWidget(axisItems={'bottom': pg.DateAxisItem(), 'left': WonAxis(orientation='left')})
         self.chart.getAxis('left').enableAutoSIPrefix(False)
+        self.chart.getAxis('left').setWidth(120)
         self.chart.setBackground('#101c2c'); self.chart.showGrid(x=True, y=True, alpha=.15)
         self.chart.setLabel('left', '가격', units='원'); self.chart.setLabel('bottom', '시간')
         self.chart.setMenuEnabled(False); self.chart.setMouseEnabled(x=False, y=False)
