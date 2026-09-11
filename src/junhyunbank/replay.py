@@ -7,7 +7,7 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable
 
 from . import __version__
 from .config import StrategyConfig
@@ -76,9 +76,8 @@ class ReplayClock:
 class ReplayMicroFlowStrategy(MicroFlowStrategy):
     """MicroFlowStrategy with freshness ages bound to ReplayClock.
 
-    The production strategy is intentionally left unchanged. Recorder trade and
-    orderbook records always contain exchange timestamps, so only local receive
-    freshness needs to be overridden for deterministic replay.
+    Production strategy code is not modified. Recorder trade/orderbook records
+    carry exchange timestamps, so replay only replaces local receive freshness.
     """
 
     def __init__(self, config: StrategyConfig, clock: ReplayClock) -> None:
@@ -87,11 +86,23 @@ class ReplayMicroFlowStrategy(MicroFlowStrategy):
 
     def on_trade(self, event: dict[str, Any]) -> None:
         market = str(event.get("code") or "")
-        before = self.latest_price(market) if market else None
+        try:
+            price = float(event.get("trade_price") or 0.0)
+            volume = float(event.get("trade_volume") or 0.0)
+        except (TypeError, ValueError):
+            price = volume = 0.0
+        valid = (
+            bool(market)
+            and math.isfinite(price)
+            and math.isfinite(volume)
+            and price > 0
+            and volume > 0
+        )
         super().on_trade(event)
-        after = self.latest_price(market) if market else None
-        if market and (after is not None) and (after != before or market in self._current):
+        if valid:
             with self._lock:
+                # super() used real process monotonic time. Replace it with the
+                # recorded logical receive time before any replay evaluation.
                 self._last_trade_received[market] = self._replay_clock.monotonic()
 
     def on_orderbook(self, event: dict[str, Any]) -> None:
@@ -150,6 +161,16 @@ def _finite_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def recording_sessions(
@@ -282,7 +303,7 @@ def _decision_row(
     book = strategy.book(market)
     entry_bid = book.bid_prices[0] if book and book.bid_prices else None
     entry_ask = book.ask_prices[0] if book and book.ask_prices else None
-    return {
+    row = {
         "seq": seq,
         "received_ns": received_ns,
         "replay_monotonic_seconds": clock.monotonic(),
@@ -305,6 +326,7 @@ def _decision_row(
         "entry_ask": entry_ask,
         "features": dict(features) if features else None,
     }
+    return _json_safe(row)
 
 
 def replay_records(
