@@ -18,8 +18,9 @@
 10. [`V4_0_4_MARKET_RECORDER.md`](V4_0_4_MARKET_RECORDER.md) — 비차단 raw trade/L2 recorder, crash-safe rotation, compression/retention, replay 데이터 형식
 11. [`V4_0_5_DETERMINISTIC_REPLAY.md`](V4_0_5_DETERMINISTIC_REPLAY.md) — recorder session 선택, logical receive clock, 동일 입력 decision fingerprint
 12. [`V4_0_6_BEST_IOC_EXECUTION_MODEL.md`](V4_0_6_BEST_IOC_EXECUTION_MODEL.md) — Upbit 최유리 지정가+IOC 실제 의미와 live top-level liquidity model 정합화
-13. [`V3_RUNTIME_HARDENING.md`](V3_RUNTIME_HARDENING.md) — V3 Public WebSocket 안정화와 런타임 진단
-14. [`V3_0_1_MARKET_DISCOVERY_FIX.md`](V3_0_1_MARKET_DISCOVERY_FIX.md) — `Trade WS 0/0` / KRW 유니버스 0개 증상, 원인 경로, V3.0.1 보완과 검증 기준
+13. [`V4_0_7_FRESH_CANDIDATE_PIPELINE.md`](V4_0_7_FRESH_CANDIDATE_PIPELINE.md) — stale 고득점 후보가 deep slot을 독점해 실제 진입 가능한 fresh 후보를 굶기는 현상과 재발 방지
+14. [`V3_RUNTIME_HARDENING.md`](V3_RUNTIME_HARDENING.md) — V3 Public WebSocket 안정화와 런타임 진단
+15. [`V3_0_1_MARKET_DISCOVERY_FIX.md`](V3_0_1_MARKET_DISCOVERY_FIX.md) — `Trade WS 0/0` / KRW 유니버스 0개 증상, 원인 경로, V3.0.1 보완과 검증 기준
 
 ## 문서 유지 규칙
 
@@ -31,4 +32,4 @@
 - Upbit API 사용 변경 → `UPBIT_INTEGRATION.md`
 - 런타임 데이터/배포 안정화 → 해당 버전의 runtime/fix 문서 및 `CHANGELOG.md`
 
-사용자가 보는 제품 이름은 **V1, V2, V3 ... 메이저 버전**을 유지하되, 같은 메이저의 수정 배포는 `V4.0.6`처럼 semantic patch tag를 사용할 수 있습니다. 이는 업데이트 버튼이 기존 설치본과 새 패치 배포를 구분할 수 있게 하기 위한 것입니다.
+사용자가 보는 제품 이름은 **V1, V2, V3 ... 메이저 버전**을 유지하되, 같은 메이저의 수정 배포는 `V4.0.7`처럼 semantic patch tag를 사용할 수 있습니다. 이는 업데이트 버튼이 기존 설치본과 새 패치 배포를 구분할 수 있게 하기 위한 것입니다.
