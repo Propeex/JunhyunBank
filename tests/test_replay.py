@@ -7,9 +7,11 @@ import pytest
 from junhyunbank.config import StrategyConfig
 from junhyunbank.replay import (
     ReplayClock,
+    ReplayInputError,
     ReplayMicroFlowStrategy,
     ReplayOptions,
     recording_sessions,
+    replay_files,
     replay_records,
     select_recording_session,
     strategy_event,
@@ -222,6 +224,23 @@ def test_recording_session_selection_uses_latest_complete_filename_group(tmp_pat
     ]
 
 
+def test_replay_files_restores_recorded_config_and_universe(tmp_path: Path):
+    path = tmp_path / "upbit-public-20260911T010101-aaaaaaaa-000001.jsonl"
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in _synthetic_session()),
+        encoding="utf-8",
+    )
+
+    result = replay_files([path])
+
+    assert result["source"]["recorded_junhyunbank_version"] == "4.0.4"
+    assert result["source"]["files"] == [path.name]
+    assert result["replay"]["strategy_config"]["min_warmup_seconds"] == 5
+    assert result["summary"]["markets"] == 1
+    assert result["summary"]["evaluations"] > 0
+    assert result["input"]["complete_session"] is True
+
+
 def test_replay_rejects_invalid_fee():
-    with pytest.raises(Exception):
+    with pytest.raises(ReplayInputError):
         ReplayOptions(bid_fee=-0.1).normalized()
