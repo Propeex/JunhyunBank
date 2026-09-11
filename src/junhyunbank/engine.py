@@ -495,6 +495,14 @@ class TradingEngine(OrderExecution):
                     if initial_risk > 0: self.storage.mark_managed_position(market, initial_risk_pct=initial_risk)
                 horizon = float((state or {}).get("expected_horizon_seconds") or 300.0)
                 decision = self.strategy.evaluate_position(market, entry_price=entry_price, current_price=current_price, peak_price=peak, initial_risk_pct=initial_risk, round_trip_cost_pct=round_trip, elapsed_seconds=elapsed, expected_horizon_seconds=horizon)
+                self.events.put({'type': 'position_diagnostic', 'market': market, 'reason': decision.reason,
+                                 'score': decision.score, 'elapsed': elapsed})
+                now = time.monotonic()
+                key = f'position:{market}'
+                previous, logged_at = self._entry_messages.get(key, ('', -60.0))
+                if now - logged_at >= 60.0 or (previous != decision.reason and now - logged_at >= 10.0) or decision.signal == Signal.SELL:
+                    self._entry_messages[key] = (decision.reason, now)
+                    self._emit('position_state', f'{market}: {decision.reason}', elapsed_seconds=elapsed, hold_quality=decision.hold_quality)
                 if decision.signal == Signal.SELL:
                     self._sell_managed(market=market, position=position, managed_qty=managed_qty, current_price=current_price, min_ask_krw=min_ask, ask_fee=ask_fee, state=state or {}, reason=decision.reason)
             if self._state != EngineState.RUNNING or self.risk.emergency: return
@@ -529,6 +537,13 @@ class TradingEngine(OrderExecution):
             decisions.sort(key=lambda item: item[1].score, reverse=True); cash_remaining = available_cash
             for market, decision, fee_info in decisions:
                 if self._state != EngineState.RUNNING or self.risk.emergency or self.storage.pending_orders(): return
+                # Earlier candidates may have waited behind fee lookups or
+                # another order. Fresh quotes alone do not keep an old signal valid.
+                decision = self.strategy.evaluate_entry(market, bid_fee=fee_info[0], ask_fee=fee_info[1], health=health, regime_factor=regime_factor)
+                if decision.signal != Signal.BUY:
+                    self._entry_status(market, f'주문 직전 재확인: {decision.reason}', score=decision.score,
+                                       expected_move_pct=decision.expected_move_pct, cost_pct=decision.round_trip_cost_pct)
+                    continue
                 bid_fee, ask_fee, min_bid, _ = fee_info; book = self.strategy.book(market)
                 if not book: continue
                 desired = cash_remaining * decision.capital_fraction

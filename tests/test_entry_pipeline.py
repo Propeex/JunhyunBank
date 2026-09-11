@@ -56,3 +56,24 @@ def test_same_raw_signal_with_unaffordable_cost_submits_nothing(tmp_path):
     engine._evaluate_cycle()
     assert client.orders==[]
     assert any('거래비용' in e.get('reason','') for e in engine.drain_events())
+
+
+def test_signal_that_expires_during_candidate_batch_does_not_place_order(tmp_path):
+    from junhyunbank.models import Signal, StrategyDecision
+    client=Exchange()
+    engine=TradingEngine(client,storage=Storage(tmp_path/'orders.db'))
+    engine._state=EngineState.RUNNING
+    engine._allowed_markets=['KRW-X']
+    engine._deep_markets=['KRW-X']
+    feed(engine.strategy)
+    original=engine.strategy.evaluate_entry
+    calls=[]
+    def evaluate(*args,**kwargs):
+        calls.append(1)
+        if len(calls)==1: return original(*args,**kwargs)
+        return StrategyDecision(Signal.HOLD,20,'상승 모멘텀 미확인')
+    engine.strategy.evaluate_entry=evaluate
+    engine._evaluate_cycle()
+    assert len(calls)==2
+    assert client.orders==[]
+    assert any('주문 직전 재확인' in e.get('reason','') for e in engine.drain_events())

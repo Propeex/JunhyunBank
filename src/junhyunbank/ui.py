@@ -43,6 +43,7 @@ class MainWindow(QMainWindow):
         self._series: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=360)); self._chart_market: str | None = "KRW-BTC"
         self._close_when_drained = False; self._update_in_progress = False; self._runtime: dict[str, Any] = {}
         self._entry_diagnostics = {}
+        self._position_diagnostics = {}
         self.setWindowTitle(f"JunhyunBank V{__version__}"); self.resize(1320, 920)
         root = QWidget(); layout = QVBoxLayout(root)
         controls = QHBoxLayout(); self.api_button = QPushButton("API 키 설정"); self.update_button = QPushButton("업데이트"); self.start_button = QPushButton("시작"); self.stop_button = QPushButton("종료"); self.emergency_button = QPushButton("긴급 정지")
@@ -79,6 +80,7 @@ class MainWindow(QMainWindow):
     def start_trading_silent(self) -> None:
         try:
             self._entry_diagnostics.clear()
+            self._position_diagnostics.clear()
             self.entry_diagnostics.clear()
             self.data_health.setText("데이터: WebSocket 연결 중 · 전략 워밍업은 기본 약 3분입니다.")
             self.engine.start(); self._sync_buttons()
@@ -158,6 +160,8 @@ class MainWindow(QMainWindow):
                     self.candidates.setText("후보 없음 · 위 데이터 상태를 확인하세요.")
             elif event_type == "entry_diagnostic":
                 self._entry_diagnostics[event['market']] = event
+            elif event_type == "position_diagnostic":
+                self._position_diagnostics[event['market']] = event
             elif event_type == "runtime_health": self._runtime_event(event)
             elif event_type == "stream_status":
                 if event.get("state") == "reconnecting":
@@ -178,6 +182,12 @@ class MainWindow(QMainWindow):
                 if event_type in {"stopped", "drain_complete", "emergency"}: self._sync_buttons()
                 if event_type == "drain_complete" and self._close_when_drained: self._close_when_drained = False; QTimer.singleShot(250, self.close)
         lines = []
+        managed = self.engine.storage.managed_markets()
+        for market, detail in list(self._position_diagnostics.items()):
+            if market not in managed:
+                self._position_diagnostics.pop(market, None)
+                continue
+            lines.append(f"[보유 {detail['elapsed']:.0f}초] {market}: {detail['reason']}")
         for market, detail in list(self._entry_diagnostics.items()):
             if market != '전체' and market not in self.engine._deep_markets:
                 self._entry_diagnostics.pop(market, None)
