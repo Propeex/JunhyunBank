@@ -1,154 +1,93 @@
-# JunhyunBank V4.0.4
+# JunhyunBank V4.0.5
+
+Upbit KRW 마켓을 24시간 감시하고 체결·호가 기반 단기 수급 신호로 실제 원화 주문을 수행하는 **Windows LIVE 전용** 자동매매 프로그램입니다.
+
+> `시작` 버튼은 실제 주문을 허용합니다. PAPER 모드는 V2부터 제거됐습니다. API Key에는 출금 권한을 부여하지 마세요.
+
+## V4.0.5 — Deterministic strategy replay
+
+V4.0.5는 V4.0.4에서 저장한 raw trade/L2 recording을 **네트워크와 실제 주문 없이** 다시 현재 JH-MicroFlow에 재생하는 offline 검증 계층을 추가합니다.
+
+`scripts/replay_strategy.py`는 recorder의 `received_monotonic_ns`를 logical clock으로 사용해 실행 PC 속도와 현재 시각에 영향을 받지 않게 freshness를 재현합니다. 당시 `StrategyConfig`와 안전 KRW universe를 복원하며, orderbook 시점의 feature·entry decision·regime·top-of-book을 기록합니다. 동일 recording, 동일 전략 코드/config/fee이면 canonical decision SHA-256 fingerprint가 동일해야 합니다.
+
+production 전략 threshold와 실거래 주문 경로는 변경하지 않습니다. replay는 depth slippage, IOC partial fill, 실제 주문 지연, portfolio PnL까지 아직 재현하지 않으므로 수익성 검증 자체가 아니라 **재현 가능한 검증 기반**입니다.
+
+상세: **[V4.0.5 Deterministic Strategy Replay](docs/V4_0_5_DETERMINISTIC_REPLAY.md)**
 
 ## V4.0.4 — Raw market data recorder
 
-V4.0.4는 전략을 더 수정하기 전에 같은 실제 시장경로를 반복 재생할 수 있도록 **비차단 raw trade/L2 recorder**를 추가합니다. `scripts/record_public_market.py`는 API Key를 읽지 않고 Public REST/WebSocket만 사용하며 주문 API를 호출하지 않습니다.
+`scripts/record_public_market.py`는 API Key 없이 Public REST/WebSocket만 사용해 전체 안전 KRW trade와 현재 Hot 후보의 L2 orderbook을 JSONL로 기록합니다.
 
-전체 안전 KRW 시장의 trade와 현재 Hot 후보의 기본 15레벨 orderbook을 기록합니다. WebSocket callback은 bounded queue에 비차단 enqueue만 하고 파일 기록·fsync·rotation·gzip은 background thread에서 처리합니다. queue가 포화되면 실시간 시세 처리를 늦추지 않고 recorder event를 drop한 뒤 종료 상태와 통계에 명시합니다. 활성 `.jsonl.part`는 fsync 후 원자적으로 finalize하며, 비정상 종료 시 마지막 완전한 줄까지 복구합니다.
+WebSocket callback에서는 bounded queue에 비차단 enqueue만 하고 파일 쓰기·fsync·rotation·gzip은 background worker가 담당합니다. queue가 포화되면 시세 callback을 막지 않고 event를 drop하고 통계/exit code에 드러냅니다. 활성 `.jsonl.part`는 fsync 후 원자적으로 finalize하며 비정상 종료 시 마지막 완전한 줄까지 복구합니다.
 
-상세 데이터 형식과 복구/보존 정책: **[V4.0.4 Raw Market Data Recorder](docs/V4_0_4_MARKET_RECORDER.md)**.
+상세: **[V4.0.4 Raw Market Data Recorder](docs/V4_0_4_MARKET_RECORDER.md)**
 
-## V4.0.3 — Read-only forward-edge 검증 기반
+## V4.0.3 — Read-only forward-edge validator
 
-V4.0.3은 실거래 전략 임계값을 바꾸지 않고, 현재 JH-MicroFlow의 BUY 판단이 실제 미래 top-of-book에서 어떤 결과를 보이는지 측정하는 검증 도구를 추가합니다. `scripts/validate_public_edge.py`는 API Key를 읽지 않고 Public REST/WebSocket만 사용하며 **주문을 절대 제출하지 않습니다.**
+`scripts/validate_public_edge.py`는 실제 Public trade/orderbook으로 현재 전략을 워밍업하고 후보 시점 entry ask → 미래 bid의 forward net return을 측정합니다. 양쪽 가정 수수료와 spread를 반영하며, 늦은 label은 `missed` 처리하고 시간순 holdout 경계에서는 forward horizon만큼 training sample을 purge합니다.
 
-후보 평가 시점의 entry ask와 미래 bid를 연결해 양쪽 가정 수수료와 spread를 지불한 forward net return을 계산하고, BUY/전체 후보를 분리합니다. label 시점 호가가 늦으면 임의의 늦은 가격을 쓰지 않고 `missed`로 기록하며, 시간순 holdout 앞에서는 forward-label horizon만큼 training 표본을 purge해 시간 누수를 막습니다.
+API Key와 주문 API를 사용하지 않으며 `orders_submitted: 0`을 명시합니다. BUY 표본과 전체 후보를 분리하지만 size별 depth slippage나 실제 체결 지연은 아직 모델링하지 않습니다.
 
-상세 설계와 해석 제한: **[V4.0.3 Forward Edge Validation](docs/V4_0_3_EDGE_VALIDATION.md)**.
+상세: **[V4.0.3 Forward Edge Validation](docs/V4_0_3_EDGE_VALIDATION.md)**
 
 ## V4.0.2 — Private 주문·자산 보조 reconciliation
 
-V4.0.2는 V4의 durable 주문 복구를 authenticated `myOrder`/`myAsset` WebSocket으로 보강합니다. Private 이벤트는 빠른 감지 신호로만 사용하고, 실제 체결량·가격·수수료·terminal 상태는 기존 identifier REST 조회를 정본으로 유지합니다. Private WS 장애가 나도 REST 복구는 계속 동작하며, `myAsset`의 계정 잔고를 JunhyunBank 자동관리 수량으로 추정하지 않습니다.
+Authenticated Private WebSocket 한 연결에서 `myOrder`와 `myAsset`을 구독합니다. Private 이벤트는 빠른 변화 신호로만 사용하고 실제 체결량·가격·수수료·terminal 상태는 identifier REST 조회를 정본으로 유지합니다.
 
-상세 설계와 검증 범위: **[V4.0.2 Private Reconciliation](docs/V4_0_2_PRIVATE_RECONCILIATION.md)**.
+`junhyunbank-` identifier 주문 이벤트만 pending reconciliation을 즉시 깨우며, Private WS 장애 시 REST fallback을 계속 사용합니다. `myAsset`의 계정 전체 잔고를 JunhyunBank 관리수량으로 추정하지 않습니다.
 
-## V4.0.1 — 업데이트 사전검증과 원자 롤백
+상세: **[V4.0.2 Private Reconciliation](docs/V4_0_2_PRIVATE_RECONCILIATION.md)**
 
-V4.0.1은 거래 전략을 바꾸지 않는 배포 안정화 패치입니다. 새 EXE를 교체한 뒤 곧바로 LIVE 자동매매를 재개하지 않고, 먼저 비거래 검증 모드로 현재 SQLite DB의 스키마/무결성을 확인합니다. 검증 실패 시 이전 EXE와 업데이트 직전 DB snapshot을 함께 복원합니다.
+## V4.0.1 — 업데이트 검증과 롤백
 
-상세 설계와 전환 주의점: **[V4.0.1 업데이트 복구](docs/V4_0_1_UPDATE_RECOVERY.md)**.
+새 EXE 적용 전 현재 EXE와 SQLite DB/WAL/SHM을 snapshot으로 보존합니다. 새 버전은 먼저 `--post-update-verify` 비거래 모드에서 DB migration, `PRAGMA quick_check`, 필수 테이블 검사를 통과하고 health marker를 남겨야 합니다. 실패하면 이전 EXE와 업데이트 직전 DB를 함께 복원하며 자동매매를 자동 재개하지 않습니다.
 
-## V4 — 매수 진단과 주문 복구
+상세: **[V4.0.1 업데이트 복구](docs/V4_0_1_UPDATE_RECOVERY.md)**
 
-- 같은 창에서 정지 후 다시 시작해도 시세 연결을 정상 복구합니다.
-- 일시적인 잔고 조회 오류로 엔진 전체가 종료되지 않도록 수정했습니다.
-- 후보 HotScore와 실제 진입 품질을 구분하고, 종목별 **매수 대기 이유·예상 변동폭·거래비용**을 표시합니다.
-- 5초 수급의 비교 기준을 과거 5초 수급으로 바로잡았습니다.
-- 주문 전에 식별자를 저장해 응답 유실과 재시작 후에도 주문 결과를 조회합니다. 미확정 주문을 중복 제출하지 않습니다.
-- 부분 체결은 실제 체결량·금액으로 기록하며, 관리 수량을 전체 계정 잔고로 추정하지 않습니다.
-- Private `myOrder` 이벤트는 pending identifier의 REST reconciliation을 앞당기며, `myAsset`은 잔고 변동 감지용 보조 신호로만 사용합니다.
+## V4 핵심 안전성
 
-상세 원인, 수정 내용, 테스트 및 남은 한계: **[V4 감사 보고서](docs/V4_AUDIT.md)**.
+V4.0.0부터 주문 전에 unique `identifier`를 SQLite에 영속화하고, POST timeout/5xx처럼 결과가 애매해도 같은 주문을 재전송하지 않고 identifier로 결과를 조회합니다. partial fill은 실제 체결량·금액·수수료만 원자적으로 반영하고, terminal 확인 전 같은 시장의 중복 주문을 차단합니다.
 
-업데이트 후 `시작`을 누르면 약 3분의 기본 워밍업을 거칩니다. 거래가 적은 종목은 더 오래 걸릴 수 있습니다. 높은 HotScore만으로 매수하지 않으며 비용과 진입 품질 조건까지 충족해야 합니다. V4는 매수 횟수를 늘리기 위해 이 조건을 낮추지 않았습니다.
-
-아래 V3 설명은 계승된 기능과 변경 이력입니다. 주문·진단의 최신 동작은 위 V4 문서를 기준으로 확인하세요.
-
-업비트 KRW 마켓을 24시간 감시하는 개인용 **LIVE 전용** 자동매매 Windows 데스크톱 프로그램입니다.
-
-> **주의:** 모의매매(PAPER) 모드는 없습니다. `시작` 버튼은 실제 업비트 계정에서 실제 원화 주문을 실행합니다. API Key에는 출금 권한을 부여하지 마세요.
-
-## 개발자 / 다음 ChatGPT 인수인계
-
-이전 대화가 없어도 개발을 이어갈 수 있도록 제품 의도, 구현 구조, 전략 명세, 검증 상태, 알려진 위험과 다음 우선순위를 GitHub에 영구 문서화했습니다.
-
-**새 개발자 또는 새 ChatGPT 세션은 [`docs/DEVELOPER_HANDOFF.md`](docs/DEVELOPER_HANDOFF.md)부터 읽으세요.**
-
-전체 문서 색인: [`docs/README.md`](docs/README.md)
-
-- [`docs/V4_AUDIT.md`](docs/V4_AUDIT.md) — V4 런타임·주문·매수 경로 감사와 남은 과제
-- [`docs/V4_0_1_UPDATE_RECOVERY.md`](docs/V4_0_1_UPDATE_RECOVERY.md) — 업데이트 health handshake와 EXE+DB rollback
-- [`docs/V4_0_2_PRIVATE_RECONCILIATION.md`](docs/V4_0_2_PRIVATE_RECONCILIATION.md) — authenticated private stream과 event-driven REST reconciliation
-- [`docs/V4_0_3_EDGE_VALIDATION.md`](docs/V4_0_3_EDGE_VALIDATION.md) — 주문 없는 public forward-edge 수집과 purged chronological holdout
-- [`docs/V4_0_4_MARKET_RECORDER.md`](docs/V4_0_4_MARKET_RECORDER.md) — 비차단 raw trade/L2 recorder와 crash-safe rotation/retention
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 런타임/모듈/주문/업데이트 구조
-- [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md) — 전략 의도, 수식, 실제 구현과 미구현 설계
-- [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 리스크, P0/P1/P2 로드맵
-- [`docs/UPBIT_INTEGRATION.md`](docs/UPBIT_INTEGRATION.md) — Upbit 인증/주문/WebSocket/Rate Limit 전제
-- [`docs/CURRENT_V2_RUNTIME_FINDINGS.md`](docs/CURRENT_V2_RUNTIME_FINDINGS.md) — V2 실사용 중 발견된 런타임 문제
-- [`docs/RUNTIME_DIAGNOSTICS_CHECKLIST.md`](docs/RUNTIME_DIAGNOSTICS_CHECKLIST.md) — 런타임 진단 체크리스트
-
-코드와 문서가 충돌하면 현재 `main` 코드가 최종 사실이며, 기능/전략을 변경할 때 관련 인수인계 문서도 함께 갱신합니다.
-
-## V3 핵심 변경 — 데이터 파이프라인 안정화
-
-V3는 **JH-MicroFlow의 진입/청산 품질 기준, 비용 배수, 자금배분 공식 자체를 완화하지 않습니다.** V2 실사용에서 발견된 WebSocket/관측성 문제를 우선 수정한 런타임 안정화 릴리즈입니다.
-
-- `websocket-client`가 자동으로 넣는 `Origin` 헤더를 Public WebSocket 연결에서 명시적으로 제거
-- 모든 WebSocket 연결 시도를 프로세스 전체에서 직렬화해 Upbit 연결 rate limit을 넘지 않도록 보호
-- 후보 종목이 바뀌어도 deep orderbook WebSocket을 끊지 않고 **동일 연결에 새 구독 메시지를 전송**
-- deep 후보에 다시 들어오는 종목은 오래된 orderbook delta 이력을 폐기한 뒤 새 호가로 다시 워밍업
-- WebSocket 서버 오류 응답을 정상 시세로 오인하지 않고 재연결/로그 처리
-- 스트림 종료 시 활성 socket을 닫아 blocking `recv()`를 즉시 깨우도록 개선
-- 화면에 Trade WS 연결 수, 마지막 체결 수신 시각, 추적 종목 수, 워밍업 완료 종목 수, 후보 수, Orderbook 상태 표시
-- 후보 목록에 **현재가 + HotScore** 직접 표시
-- 후보가 아직 없어도 기본 `KRW-BTC` 실시간 가격 차트를 표시해 데이터 수신 여부를 즉시 확인 가능
-- 5분 이상 후보가 없으면 단순 전략 대기로 숨기지 않고 실시간 데이터 상태 확인 경고
-- CI 및 Windows Release 전에 **실제 Upbit Public WebSocket read-only smoke test** 수행
+JunhyunBank가 직접 체결해 확보한 **managed quantity만 자동매도**합니다. 프로그램 실행 전 사용자가 보유하던 코인이나 사용자가 별도로 추가한 수량을 계정 총잔고로 추정해 자동관리하지 않습니다.
 
 ## JH-MicroFlow 전략
 
-V2에서 도입한 단기 수급/호가 기반 전략 구조를 V3에서도 유지합니다.
+전략은 각 코인의 절대값보다 자기 자신의 최근 상태 대비 상대적 이상현상을 봅니다.
 
-- 전체 KRW 체결 스트림 감시 + Hot 후보 orderbook 정밀 분석
-- Activity / Aggression / Book Pressure / Momentum을 종목별 rolling percentile로 정규화
+- 전체 KRW `trade` WebSocket 감시, Hot 후보만 deep `orderbook` 분석
+- Activity / Aggression / Book Pressure / Momentum rolling percentile
+- 네 요소 geometric mean 기반 Quality
 - IGNITION / PULLBACK CONTINUATION 진입
-- 실제 계정 수수료, 스프레드, 호가 기반 예상 슬리피지를 반영한 거래비용 필터
-- 고정 1회 주문금액, 시간당 거래횟수, 최대 보유종목 수 같은 임의의 전략 cap 없음
-- 신호 품질·시장상태·최근 전략성과·현재 호가 유동성으로 주문금액을 동적 계산
-- 고정 익절/손절 대신 수급 약화, Adaptive Trailing, 동적 Emergency Stop, 기대시간 실패 청산
-- Strategy Health Governor로 최근 위험 정규화 성과 악화 시 신규 노출 축소/중단
-- 업비트 시장 경보 종목 신규 진입 차단
-- JunhyunBank가 직접 연 관리 수량만 자동매도
+- 실제 계정 수수료 + spread + 호가 예상 slippage 비용 gate
+- 시장 Regime과 Strategy Health를 반영한 동적 자금배분
+- 고정 `1회 최대 N원`, `시간당 N회`, `최대 N종목` 같은 임의 전략 cap 없음
+- 수급 약화, Adaptive Trailing, entry 시 고정한 Emergency Risk, 기대시간 실패 기반 청산
+- stale trade/orderbook, 반복 API 오류, 경보/해석불가 시장에서는 신규매수 차단
+
+현재 `ExpectedMove`는 조건부 미래 상승 기대수익 모델이 아니라 최근 `|30초 수익률|` 분포 기반의 **절대 변동폭 proxy**입니다. 따라서 실제 recorder/OOS 근거 없이 threshold를 완화하거나 Kelly류 sizing을 추가하지 않습니다.
 
 ## 종료 동작
 
-`종료`를 누르면 즉시 신규 매수를 차단하고 엔진 상태가 `DRAINING`으로 바뀝니다. JunhyunBank가 관리 중인 포지션은 MicroFlow의 정상 청산 규칙에 따라 계속 관리하며, 모두 청산된 뒤 자동매매 엔진이 종료됩니다.
+일반 `종료`는 즉시 신규매수를 막고 `DRAINING`으로 전환합니다. JunhyunBank 관리 포지션은 기존 전략 청산 규칙으로 계속 관리하고 모두 종료된 뒤 엔진을 멈춥니다.
 
-`긴급 정지`는 다릅니다. 전략/신규 주문을 즉시 중지하며 현재 보유 포지션을 강제로 매도하지 않습니다.
+`긴급 정지`는 전략과 신규주문을 즉시 정지하지만 보유자산을 강제 시장가 청산하는 기능이 아닙니다.
 
 ## 업데이트
 
-V2부터 상단 `업데이트` 버튼을 지원합니다. V4.0.1부터 새 updater가 생성하는 적용 스크립트는 다음 순서를 사용합니다.
+상단 `업데이트`는 GitHub 최신 Release의 `JunhyunBank.exe`를 내려받고 Release SHA-256 digest를 검증한 뒤 staged update를 수행합니다. V4.0.1 이후 업데이트는 새 바이너리 health 검증이 성공한 경우에만 정상 실행/자동재개합니다.
 
-1. GitHub 최신 Release의 `JunhyunBank.exe`를 다운로드하고 Release SHA-256 digest를 검증합니다.
-2. 현재 프로그램이 완전히 종료된 뒤 기존 EXE와 SQLite DB/WAL/SHM을 snapshot으로 보존합니다.
-3. 새 EXE로 교체한 뒤 `--post-update-verify` 비거래 모드로 실행합니다.
-4. 새 버전이 DB migration, `PRAGMA quick_check`, 필수 테이블 확인을 통과하고 token/version health marker를 남겼는지 검증합니다.
-5. 실패하면 이전 EXE와 업데이트 직전 DB snapshot을 함께 복원하고, 이전 버전을 **자동매매 자동재개 없이** 실행합니다.
-6. 성공한 경우에만 backup을 제거하고 새 버전을 정상 실행합니다. 업데이트 직전 자동매매가 실행 중이었다면 이 단계 이후 LIVE 감시를 자동 재개합니다.
-
-API Key는 실행파일 내부가 아니라 운영체제 keyring에 저장되므로 업데이트 후 다시 입력할 필요가 없습니다. 거래/포지션/미확정 주문 상태는 `~/.junhyunbank/junhyunbank.db`에 유지됩니다.
-
-주의: V4.0.0 → V4.0.1 최초 업데이트는 적용 스크립트를 V4.0.0 코드가 생성하므로 새 transactional rollback은 **V4.0.1 설치 이후 다음 업데이트부터** 완전히 적용됩니다.
+API Key는 실행파일이 아니라 OS keyring에 저장되므로 업데이트 후 다시 입력할 필요가 없습니다. 관리 포지션, 주문 의도, 거래상태는 `~/.junhyunbank/junhyunbank.db`에 유지됩니다.
 
 ## UI
 
 - 좌측: 실시간 후보 및 운영 로그
-- 우측 상단: 넓은 보유자산 목록
+- 우측 상단: 보유자산 목록, KRW 포함
 - 우측 하단: 실시간 가격 차트
-- 보유자산 첫 행에 KRW 원화 잔고 표시
-- 각 코인에 `JunhyunBank` 자동관리 여부 표시
-- 전략 건강도와 시장 Regime 표시
-- 데이터 상태 줄에서 WebSocket/워밍업/후보 상태를 실시간 확인
+- 후보별 현재가 + HotScore + 매수 대기 사유/진입 품질
+- Trade WS, 마지막 체결, 워밍업, 후보, Orderbook 상태
+- 전략 건강도와 Market Regime
 
-## 데이터/실행 구조
-
-전체 KRW 마켓의 `trade` WebSocket을 여러 persistent 연결로 분할해 실시간 수집합니다. 1초 단위 프레임으로 거래대금과 BID/ASK 체결을 집계하고, 상대적으로 뜨거워진 후보에 대해서만 `orderbook`을 구독해 5개 호가쌍의 OBI·Microprice·호가 변화 및 실제 체결 가능 금액을 분석합니다.
-
-V4 런타임은 `runtime_engine.TradingEngine`이 핵심 `engine.TradingEngine`을 상속합니다. V4에서는 이 구조 위에 주문 의도 영속화, 재시작/체결 복구, Private account event 보조 reconciliation이 추가돼 있습니다. V4.0.4의 recorder는 이 live runtime과 분리된 Public-only 연구 도구입니다.
-
-주문은 일반 진입/청산에 Upbit `best + IOC`를 사용합니다. Emergency Stop 청산에서 IOC가 명시적으로 종료되고 0체결임이 확인된 경우에만 시장가 매도를 보조 수단으로 사용할 수 있습니다. 거래소 API Rate Limit은 전략상의 거래횟수 제한과 별개로 항상 준수합니다.
-
-## 보안
-
-- Access Key / Secret Key는 GitHub, SQLite, 로그에 저장하지 않습니다.
-- Python `keyring`을 통해 OS 자격증명 저장소를 사용합니다.
-- Private WebSocket JWT는 매 연결마다 새로 만들고 로그에 남기지 않습니다.
-- 출금 API는 구현하지 않습니다.
-- API 오류 반복, 오래된 trade/orderbook 데이터, 최소 주문금액 미달에서는 신규 주문을 차단합니다.
-
-## 개발/테스트
+## 개발·검증 명령
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -156,13 +95,34 @@ pytest -q
 python scripts/smoke_upbit_public_ws.py --timeout 20 --attempts 3
 python scripts/validate_public_edge.py --seconds 1800 --output edge-validation.json
 python scripts/record_public_market.py --seconds 3600 --output-dir ~/.junhyunbank/recordings
+python scripts/replay_strategy.py --input ~/.junhyunbank/recordings --session latest --output replay.json
 python launcher.py
 ```
 
-Public WebSocket smoke test, forward-edge validator, raw market recorder는 실제 Upbit Public REST/WebSocket만 사용하며 **API Key와 주문 API를 사용하지 않습니다.** Private account WebSocket은 CI에 실계정 API Key를 넣지 않으므로 protocol/auth/reconciliation을 mock regression으로 검증하고, 실제 authenticated 연결은 설치 후 운영 로그에서 별도로 확인합니다.
+Public smoke, forward-edge validator, raw recorder는 실제 Upbit Public API만 사용하고 주문하지 않습니다. deterministic replay는 네트워크 자체를 사용하지 않습니다. Private account WebSocket은 CI에 실계정 API Key를 두지 않으므로 protocol/auth/reconciliation을 mock 회귀테스트로 검증합니다.
 
-`main` 병합 시 GitHub Actions가 Windows에서 단위/회귀 테스트와 Public REST/WebSocket smoke test를 통과한 뒤 `JunhyunBank.exe`를 빌드하고 전체 패키지 버전에 맞는 Release(`V4.0.4` 등)를 생성합니다.
+`main` 병합 시 GitHub Actions가 Windows/Ubuntu 단위·회귀 테스트와 실제 Upbit Public REST/WebSocket smoke를 통과합니다. Release workflow는 Windows에서 다시 테스트/smoke 후 PyInstaller EXE를 빌드해 package version과 같은 `V4.0.x` Release를 생성합니다.
 
-## 전략 검증에 대한 원칙
+## 검증 상태와 다음 단계
 
-코드/실서버 연결 테스트 통과는 수익성 검증을 뜻하지 않습니다. V4.0.3의 forward-edge 계측과 V4.0.4의 raw recorder는 현재 전략을 같은 시장경로에서 반복 검증하기 위한 기반입니다. 아직 deterministic replay, depth slippage·실제 주문지연·충분한 장기간 purged OOS를 포함한 완전한 수익성 검증은 아닙니다. 특히 현재 `ExpectedMove`는 진정한 조건부 미래수익 모델이 아니라 최근 절대 변동폭 proxy입니다.
+코드/실서버 연결 테스트 성공은 수익성 검증을 뜻하지 않습니다. V4.0.3의 forward label, V4.0.4의 crash-safe raw recorder, V4.0.5의 deterministic replay로 **측정 → 저장 → 동일 경로 재현**의 기반까지 구축합니다.
+
+다음 단계는 replay 위에 주문 크기별 L2 depth walk, IOC partial fill, execution delay를 적용하는 simulator와 purged walk-forward/stress harness를 추가하는 것입니다. 충분한 여러 시장상태의 데이터가 쌓인 이후에만 Conditional ExpectedMove와 uncertainty-aware sizing을 현재 proxy와 OOS에서 비교합니다.
+
+## 개발자 / 다음 ChatGPT 인수인계
+
+새 세션에서는 **[`docs/DEVELOPER_HANDOFF.md`](docs/DEVELOPER_HANDOFF.md)** 를 먼저 읽으세요. 전체 문서 색인은 [`docs/README.md`](docs/README.md)입니다.
+
+핵심 문서:
+
+- [`docs/V4_AUDIT.md`](docs/V4_AUDIT.md)
+- [`docs/V4_0_1_UPDATE_RECOVERY.md`](docs/V4_0_1_UPDATE_RECOVERY.md)
+- [`docs/V4_0_2_PRIVATE_RECONCILIATION.md`](docs/V4_0_2_PRIVATE_RECONCILIATION.md)
+- [`docs/V4_0_3_EDGE_VALIDATION.md`](docs/V4_0_3_EDGE_VALIDATION.md)
+- [`docs/V4_0_4_MARKET_RECORDER.md`](docs/V4_0_4_MARKET_RECORDER.md)
+- [`docs/V4_0_5_DETERMINISTIC_REPLAY.md`](docs/V4_0_5_DETERMINISTIC_REPLAY.md)
+- [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md)
+- [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md)
+- [`docs/UPBIT_INTEGRATION.md`](docs/UPBIT_INTEGRATION.md)
+
+코드와 문서가 충돌하면 현재 `main` 코드가 source of truth입니다.
