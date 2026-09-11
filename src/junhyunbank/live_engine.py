@@ -53,15 +53,20 @@ class TradingEngine(RuntimeTradingEngine):
         relaxed. Existing managed positions remain in the deep set regardless of
         entry freshness because exits must continue to be monitored.
         """
+        now = time.monotonic()
         stale_limit = max(0.1, float(self.config.safety.market_data_stale_seconds))
         scanner_limit = max(1, int(self.config.strategy.scanner_candidate_count))
+        deep_limit = max(1, int(self.config.strategy.deep_candidate_count))
         managed = set(self.storage.managed_markets())
         supplied = {market for market, _ in ranked}
 
         actionable: list[tuple[str, float]] = []
         stale_skipped = 0
         for market, score in ranked:
-            if market in managed or self.strategy.trade_age(market) <= stale_limit:
+            # Managed positions are exit-monitoring targets, not entry slots.
+            if market in managed:
+                continue
+            if self.strategy.trade_age(market) <= stale_limit:
                 actionable.append((market, score))
             else:
                 stale_skipped += 1
@@ -98,23 +103,59 @@ class TradingEngine(RuntimeTradingEngine):
         self._candidate_stale_skipped = stale_skipped
         self._candidate_supplemented = supplemented
 
-        selected = super()._select_deep_markets(deduped)
-        # The base selector has a minimum-residency anti-churn rule. Entry
-        # candidates that became stale must override that residency; otherwise
-        # they can still occupy a deep slot for up to 30 seconds. Managed
-        # positions are the only exception.
-        selected = [
+        desired = [
             market
-            for market in selected
-            if market in managed or self.strategy.trade_age(market) <= stale_limit
+            for market, _ in deduped[:deep_limit]
+            if market in self._allowed_markets
         ]
+        scores = dict(deduped)
+        selected: list[str] = sorted(managed)
+
+        # Preserve anti-churn residency only while an entry candidate is still
+        # fresh enough to be actionable. Stale non-managed candidates are
+        # deliberately not carried forward, even if their 30-second residency
+        # has not elapsed.
+        for market in self._deep_markets:
+            if market in managed or market not in self._allowed_markets:
+                continue
+            if self.strategy.trade_age(market) > stale_limit:
+                continue
+            age = now - self._deep_entered_at.get(market, now)
+            if market in desired or age < self.config.strategy.deep_min_residency_seconds:
+                selected.append(market)
+
+        def nonmanaged_count() -> int:
+            return sum(1 for market in selected if market not in managed)
+
+        for market in desired:
+            if market in selected:
+                continue
+            if nonmanaged_count() < deep_limit:
+                selected.append(market)
+                continue
+            replaceable = [
+                current
+                for current in selected
+                if current not in managed
+                and current not in desired
+                and now - self._deep_entered_at.get(current, now)
+                >= self.config.strategy.deep_min_residency_seconds
+            ]
+            if not replaceable:
+                continue
+            weakest = min(replaceable, key=lambda current: scores.get(current, 0.0))
+            if (
+                scores.get(market, 0.0)
+                >= scores.get(weakest, 0.0) + self.config.strategy.deep_switch_margin
+            ):
+                selected.remove(weakest)
+                selected.append(market)
 
         if (
             not deduped
-            and time.monotonic() - self._run_started_at
+            and now - self._run_started_at
             >= self.config.strategy.no_candidate_warning_seconds
         ):
-            now = time.monotonic()
             if now - self._last_no_candidate_warning >= 60.0:
                 self._last_no_candidate_warning = now
                 detail = (
@@ -134,15 +175,12 @@ class TradingEngine(RuntimeTradingEngine):
     def _publish_runtime_health(self, ranked: list[tuple[str, float]]) -> None:
         # The UI's candidate count should describe markets that can actually
         # advance to deep entry analysis, not stale scanner-only remnants.
-        effective = list(self._actionable_ranked) if self._actionable_ranked else []
-        super()._publish_runtime_health(effective)
+        super()._publish_runtime_health(list(self._actionable_ranked))
 
     def drain_events(self, limit: int = 200) -> list[dict]:
         """Rewrite candidate UI events to the same actionable set used live."""
         items = super().drain_events(limit)
         top = list(self._actionable_ranked[:12])
-        if not top and not self._actionable_ranked:
-            top = []
         for event in items:
             if event.get("type") != "candidates":
                 continue
