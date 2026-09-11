@@ -1,3 +1,15 @@
+# V4.0.6 — Upbit Best+IOC 실행 모델 정합화
+
+- Upbit 공식 `best` 주문이 접수 시점 상대 최우선호가를 가격으로 쓰는 지정가이며 IOC remainder는 취소된다는 사양에 live pre-trade model을 맞춤.
+- 기존 multi-level depth-walk 가정 대신 BUY는 best ask, SELL은 best bid의 current top-level capacity만 즉시 체결 가능으로 계산.
+- 신규 position의 동적 liquidity cap을 current best ask/bid 양방향 즉시 체결 notional 중 작은 값으로 제한.
+- 요청량이 top-level capacity를 넘을 때 더 불리한 L2에 체결된다고 가정하지 않고 unfilled/cancel 가능량으로 처리.
+- `execution_model.py`에 Best+IOC 순수 실행모델을 분리해 다음 execution simulator도 같은 의미를 재사용할 수 있게 함.
+- production `main.py`는 `live_engine.TradingEngine`을 사용하며 기존 runtime/주문상태/managed quantity 경로는 그대로 상속.
+- 실제 REST 주문은 계속 `ord_type=best`, `time_in_force=ioc`; 주문 타입이나 JH-MicroFlow threshold는 변경하지 않음.
+- deeper L2/큰 ExpectedMove가 Best+IOC capacity를 인위적으로 늘리지 못하는 회귀테스트와 실제 order payload 회귀테스트 추가.
+- 상세 설계: [V4.0.6 Best+IOC Execution Model](docs/V4_0_6_BEST_IOC_EXECUTION_MODEL.md).
+
 # V4.0.5 — Deterministic strategy replay
 
 - V4.0.4 recorder session을 네트워크와 실제 주문 없이 재생하는 `scripts/replay_strategy.py` 추가.
