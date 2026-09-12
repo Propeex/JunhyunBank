@@ -77,3 +77,19 @@ def test_signal_that_expires_during_candidate_batch_does_not_place_order(tmp_pat
     assert len(calls)==2
     assert client.orders==[]
     assert any('주문 직전 재확인' in e.get('reason','') for e in engine.drain_events())
+
+
+def test_small_dynamic_allocation_replaces_buy_diagnostic_with_amount_block(tmp_path):
+    client=Exchange()
+    client.get_accounts=lambda:[{'currency':'KRW','balance':'5000'}]
+    engine=TradingEngine(client,storage=Storage(tmp_path/'orders.db'))
+    engine._state=EngineState.RUNNING
+    engine._allowed_markets=['KRW-X']; engine._deep_markets=['KRW-X']
+    feed(engine.strategy)
+    engine._evaluate_cycle()
+    assert client.orders==[]
+    diagnostics=[e for e in engine.drain_events() if e['type']=='entry_diagnostic' and e['market']=='KRW-X']
+    final=diagnostics[-1]
+    assert '매수 차단' in final['reason']
+    assert 0 < final['amount_krw'] < final['min_order_krw']==5000
+    assert final['available_cash']==5000

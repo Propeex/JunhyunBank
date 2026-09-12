@@ -276,9 +276,19 @@ class TradingEngine(OrderExecution):
     def _finite_age(value: float) -> float | None:
         return value if math.isfinite(value) else None
 
-    def _publish_runtime_health(self, ranked: list[tuple[str, float]]) -> None:
-        self.events.put({'type': 'activity', **self.storage.activity_snapshot(),
+    def _publish_activity(self) -> None:
+        try:
+            snapshot = self.storage.activity_snapshot()
+        except Exception as exc:
+            # The dashboard is optional; a read failure must not interrupt
+            # order supervision or prevent the final stopped notification.
+            self.events.put({'type': 'warning', 'message': f'실제 체결 화면 갱신 실패: {exc}'})
+            return
+        self.events.put({'type': 'activity', **snapshot,
                          'evaluation_cycles': self._evaluation_cycles})
+
+    def _publish_runtime_health(self, ranked: list[tuple[str, float]]) -> None:
+        self._publish_activity()
         tracked = sum(1 for market in self._allowed_markets if self.strategy.latest_price(market))
         warmed = sum(
             1
@@ -373,6 +383,9 @@ class TradingEngine(OrderExecution):
                         self._emit("warning", f"자산 갱신 실패: {exc}")
                     next_portfolio = now + self.config.strategy.portfolio_publish_seconds
                 if self._state == EngineState.DRAINING and not self.storage.managed_markets() and not self.storage.pending_orders():
+                    # The last sell may have settled after this cycle's runtime
+                    # snapshot. Publish it before the UI receives drain_complete.
+                    self._publish_activity()
                     self._emit("drain_complete", "관리 포지션 청산이 완료되어 자동매매를 종료합니다.")
                     break
                 self._hard_stop.wait(0.10)
@@ -385,6 +398,7 @@ class TradingEngine(OrderExecution):
             if self._deep_stream:
                 self._deep_stream.stop(); self._deep_stream = None
             self._state = EngineState.STOPPED
+            self._publish_activity()
             if not self._update_shutdown:
                 self._emit("stopped", "자동매매 엔진 종료")
 
@@ -590,7 +604,12 @@ class TradingEngine(OrderExecution):
                     self._entry_status(market, '실제 호가 유동성/왕복 거래비용 조건 미달', amount_krw=amount, cost_pct=actual_cost); continue
                 check = self.risk.can_open(available_cash=cash_remaining, amount_krw=amount, min_order_krw=min_bid, stream_age_seconds=max(self.strategy.trade_age(market), self.strategy.book_age(market)))
                 if not check.allowed:
-                    self._emit("risk", f"{market} 매수 차단: {check.reason}"); continue
+                    self._entry_status(market, f'매수 차단: {check.reason}', amount_krw=amount,
+                                       min_order_krw=max(min_bid, self.config.safety.min_order_krw),
+                                       available_cash=cash_remaining, capital_fraction=decision.capital_fraction)
+                    self._emit("risk", f"{market} 매수 차단: {check.reason}", amount_krw=amount,
+                               min_order_krw=max(min_bid, self.config.safety.min_order_krw), available_cash=cash_remaining)
+                    continue
                 self._buy_managed(market=market, amount_krw=amount, decision=decision, bid_fee=bid_fee, actual_round_trip_cost=actual_cost)
                 cash_remaining = max(0.0, cash_remaining - amount * (1.0 + bid_fee))
 
