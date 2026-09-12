@@ -288,6 +288,17 @@ class Storage:
             rows = conn.execute("SELECT * FROM order_intents WHERE status='pending' ORDER BY created_at").fetchall()
         return [{**dict(row), 'context': json.loads(row['context'])} for row in rows]
 
+    def activity_snapshot(self) -> dict:
+        """Read confirmed fills and unresolved intents; never infer fills from signals."""
+        today = datetime.now().date().isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute('BEGIN')
+            rows = conn.execute("SELECT id,created_at,market,side,quantity,amount_krw,price,reason FROM trades WHERE mode='LIVE' AND quantity>0 AND price>0 AND amount_krw>0 ORDER BY id DESC LIMIT 100").fetchall()
+            counts = conn.execute("SELECT side,COUNT(*) AS count FROM trades WHERE mode='LIVE' AND quantity>0 AND price>0 AND amount_krw>0 AND created_at>=? GROUP BY side", (today,)).fetchall()
+            pending = conn.execute("SELECT market,side,created_at FROM order_intents WHERE status='pending' ORDER BY created_at").fetchall()
+        return dict(trades=[dict(r) for r in rows], counts={r['side']:r['count'] for r in counts},
+                    pending=[dict(r) for r in pending], date=today)
+
     def reject_order_intent(self, identifier: str, error: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("UPDATE order_intents SET status='rejected',error=? WHERE identifier=? AND status='pending'", (error, identifier))

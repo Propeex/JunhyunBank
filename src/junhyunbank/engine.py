@@ -41,6 +41,7 @@ class TradingEngine(OrderExecution):
         self._last_price_ui_emit: dict[str, float] = {}
         self._scan_seconds = self._evaluation_seconds = 0.0
         self._last_runtime_sample = 0.0
+        self._evaluation_cycles = 0
         self._order_lock = threading.Lock()
         self._fee_cache: dict[str, tuple[float, float, float, float, float]] = {}
         self._session_start_equity: float | None = None
@@ -78,6 +79,7 @@ class TradingEngine(OrderExecution):
         self._entry_messages.clear()
         self._fee_cache.clear()
         self._last_price_ui_emit.clear()
+        self._evaluation_cycles = 0
         self._scan_seconds = self._evaluation_seconds = 0.0
         self._last_runtime_sample = 0.0
         self._market_discovery_retry_at = 0.0
@@ -275,6 +277,8 @@ class TradingEngine(OrderExecution):
         return value if math.isfinite(value) else None
 
     def _publish_runtime_health(self, ranked: list[tuple[str, float]]) -> None:
+        self.events.put({'type': 'activity', **self.storage.activity_snapshot(),
+                         'evaluation_cycles': self._evaluation_cycles})
         tracked = sum(1 for market in self._allowed_markets if self.strategy.latest_price(market))
         warmed = sum(
             1
@@ -359,6 +363,7 @@ class TradingEngine(OrderExecution):
                 if now >= next_evaluation:
                     evaluation_started = time.monotonic()
                     self._evaluate_cycle()
+                    self._evaluation_cycles += 1
                     self._evaluation_seconds = time.monotonic() - evaluation_started
                     next_evaluation = now + self.config.strategy.evaluation_seconds
                 if now >= next_portfolio:

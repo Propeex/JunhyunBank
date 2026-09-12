@@ -3,10 +3,12 @@ from __future__ import annotations
 import math
 import threading
 import time
+from datetime import datetime
 from collections import defaultdict, deque
 from typing import Any
 
 import pyqtgraph as pg
+from PySide6.QtGui import QColor
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget
 
@@ -53,10 +55,12 @@ class MainWindow(QMainWindow):
         super().__init__(); self.engine = engine; self.key_store = key_store
         self._series: dict[str, deque[tuple[float, float]]] = defaultdict(lambda: deque(maxlen=3601)); self._chart_market = "KRW-BTC"
         self._average_prices: dict[str, float] = {}
+        self._trade_history: list[dict] = []
+        self._activity_signature = None
         self._close_when_drained = False; self._update_in_progress = False; self._runtime: dict[str, Any] = {}
         self._entry_diagnostics = {}
         self._position_diagnostics = {}
-        self.setWindowTitle(f"JunhyunBank V{__version__}"); self.resize(1320, 920)
+        self.setWindowTitle(f"JunhyunBank V{__version__}"); self.resize(1440, 1000)
         root = QWidget(); layout = QVBoxLayout(root)
         controls = QHBoxLayout(); self.api_button = QPushButton("API 키 설정"); self.update_button = QPushButton("업데이트"); self.start_button = QPushButton("시작"); self.stop_button = QPushButton("종료"); self.emergency_button = QPushButton("긴급 정지")
         controls.addWidget(QLabel("LIVE 전용")); controls.addWidget(self.api_button); controls.addWidget(self.update_button); controls.addStretch(); controls.addWidget(self.start_button); controls.addWidget(self.stop_button); controls.addWidget(self.emergency_button); layout.addLayout(controls)
@@ -66,6 +70,10 @@ class MainWindow(QMainWindow):
         self.buy_status = QLabel("매수 상태: 시작 후 연결 상태와 진입 조건을 확인합니다.")
         self.buy_status.setWordWrap(True); self.buy_status.setStyleSheet('padding: 10px; background: #eaf2fc; color: #16385b; border-radius: 6px;')
         layout.addWidget(self.buy_status)
+        self.activity_summary = QLabel('실제 체결 기록 확인 대기 · 후보 신호는 체결 건수에 포함하지 않습니다.')
+        self.activity_summary.setStyleSheet('font-size: 15px; font-weight: bold; padding: 8px; color: #16385b; background: #edf7f5;')
+        self.activity_summary.setWordWrap(True); layout.addWidget(self.activity_summary)
+        self.pending_status = QLabel('미확정 주문 확인 대기'); self.pending_status.setWordWrap(True); layout.addWidget(self.pending_status)
         self.entry_diagnostics = QTextEdit()
         self.entry_diagnostics.setReadOnly(True)
         self.entry_diagnostics.setMaximumHeight(150)
@@ -78,6 +86,19 @@ class MainWindow(QMainWindow):
         self.assets.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.assets.cellClicked.connect(self._asset_clicked)
         self.asset_status = QLabel('잔고 확인 대기'); self.asset_status.setWordWrap(True); asset_layout.addWidget(self.asset_status)
+        self.assets.setMaximumHeight(140)
+        asset_box.setMaximumHeight(155)
+        trades_box = QGroupBox('최근 실제 체결 100건 · 확인 시각 기준 / 행을 누르면 차트 이동')
+        trades_layout = QVBoxLayout(trades_box)
+        self.trade_table = QTableWidget(0, 6)
+        self.trade_table.setHorizontalHeaderLabels(['확인 시각', '종목', '매수/매도', '체결가', '체결금액', '판단 이유'])
+        self.trade_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.trade_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.trade_table.horizontalHeader().setStretchLastSection(True)
+        self.trade_table.setMaximumHeight(170)
+        self.trade_table.setMinimumHeight(125)
+        self.trade_table.cellClicked.connect(self._trade_clicked)
+        trades_layout.addWidget(self.trade_table); right.addWidget(trades_box)
         chart_box = QGroupBox("실시간 가격 · 종목을 선택해 추적"); chart_layout = QVBoxLayout(chart_box)
         chart_controls = QHBoxLayout()
         self.market_selector = QComboBox(); self.market_selector.setMinimumWidth(150); self.market_selector.addItem('KRW-BTC')
@@ -93,16 +114,20 @@ class MainWindow(QMainWindow):
         self.chart.setLabel('left', '가격', units='원'); self.chart.setLabel('bottom', '시간')
         self.chart.setMenuEnabled(False); self.chart.setMouseEnabled(x=False, y=False)
         self.curve = self.chart.plot([], pen=pg.mkPen('#54c9ff', width=2))
+        self.buy_markers = pg.ScatterPlotItem(symbol='t1', size=13, brush='#f47282', pen='#ffffff')
+        self.sell_markers = pg.ScatterPlotItem(symbol='t', size=13, brush='#63a8ff', pen='#ffffff')
+        self.chart.addItem(self.buy_markers); self.chart.addItem(self.sell_markers)
         self.average_line = pg.InfiniteLine(angle=0, pen=pg.mkPen('#ffbd69', width=1.5), label='보유 평균단가 {value:,.4f}원')
         self.chart.addItem(self.average_line); self.average_line.hide()
         chart_layout.addWidget(self.chart_title); chart_layout.addWidget(self.chart)
-        self.chart_note = QLabel('시작 후 수신한 실제 체결을 초 단위로 표시합니다. 10초 이상 수신 공백은 선을 끊습니다.')
+        self.chart_note = QLabel('수신 시세 · 10초 초과 공백은 선을 끊습니다. 분홍 ▲ 매수 / 파랑 ▼ 매도는 실제 체결 확인 시점입니다.')
         self.chart_note.setWordWrap(True); chart_layout.addWidget(self.chart_note)
         self.market_selector.currentTextChanged.connect(self._select_chart_market)
         self.range_selector.currentIndexChanged.connect(self._render_chart)
         right.addWidget(chart_box, 3); body.addLayout(right, 3); layout.addLayout(body, 1); self.setCentralWidget(root)
         self.api_button.clicked.connect(self.configure_api); self.update_button.clicked.connect(self.check_for_update); self.start_button.clicked.connect(self.start_trading); self.stop_button.clicked.connect(self.stop_trading); self.emergency_button.clicked.connect(self.emergency_stop)
         self.timer = QTimer(self); self.timer.timeout.connect(self.poll_events); self.timer.start(200); self._sync_buttons()
+        self._activity_event(self.engine.storage.activity_snapshot())
 
     def _sync_buttons(self) -> None:
         running = self.engine.running; draining = self.engine.state == EngineState.DRAINING
@@ -185,6 +210,7 @@ class MainWindow(QMainWindow):
         for event in self.engine.drain_events():
             event_type = event.get("type")
             if event_type == "price": self._price_event(event)
+            elif event_type == 'activity': self._activity_event(event)
             elif event_type == "portfolio": self._portfolio_event(event)
             elif event_type == "candidates":
                 markets, scores, prices = event.get("markets", []), event.get("scores", {}), event.get("prices", {})
@@ -278,6 +304,31 @@ class MainWindow(QMainWindow):
         if item and item.text().startswith('KRW-'):
             self._ensure_chart_market(item.text()); self.market_selector.setCurrentText(item.text())
 
+    def _trade_clicked(self, row: int, column: int) -> None:
+        item = self.trade_table.item(row, 1)
+        if item:
+            self._ensure_chart_market(item.text()); self.market_selector.setCurrentText(item.text())
+
+    def _activity_event(self, event: dict) -> None:
+        counts = event.get('counts', {})
+        self.activity_summary.setText(f"{event.get('date', datetime.now().date().isoformat())} 실제 체결 · 매수 {counts.get('BUY', 0)}건   매도 {counts.get('SELL', 0)}건   | 이번 실행 판단 {event.get('evaluation_cycles', 0)}회")
+        pending = event.get('pending', [])
+        self.pending_status.setText('주문 확인 중: ' + ' · '.join(f"{p['market']} {'매수' if p['side']=='BUY' else '매도'} ({p['created_at']})" for p in pending) if pending else '현재 미확정 주문 없음')
+        trades = event.get('trades', [])
+        signature = tuple(t['id'] for t in trades)
+        if signature == self._activity_signature: return
+        self._activity_signature = signature; self._trade_history = trades
+        self.trade_table.setRowCount(len(trades))
+        for row, trade in enumerate(trades):
+            buy = trade['side'] == 'BUY'
+            values = [trade['created_at'][:19].replace('T', ' '), trade['market'], '매수 체결' if buy else '매도 체결',
+                      price_text(float(trade['price'])), f"{float(trade['amount_krw']):,.0f}원", trade['reason']]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value)); item.setToolTip(str(value))
+                if col == 2: item.setForeground(QColor('#c4354f' if buy else '#2166b5'))
+                self.trade_table.setItem(row, col, item)
+        self._render_chart()
+
     def _render_chart(self, *_args) -> None:
         now = time.time(); window = int(self.range_selector.currentData() or 300)
         points = [(t, p) for t, p in self._series[self._chart_market] if now - window <= t <= now + 2]
@@ -286,6 +337,14 @@ class MainWindow(QMainWindow):
             if xs and t - xs[-1] > 10: xs.append(t - .001); ys.append(float('nan'))
             xs.append(t); ys.append(p)
         self.curve.setData(xs, ys, connect='finite')
+        markers = {'BUY': ([], []), 'SELL': ([], [])}
+        for trade in self._trade_history:
+            if trade['market'] != self._chart_market or trade['side'] not in markers: continue
+            try: timestamp = datetime.fromisoformat(trade['created_at']).timestamp()
+            except (ValueError, TypeError): continue
+            if now - window <= timestamp <= now:
+                markers[trade['side']][0].append(timestamp); markers[trade['side']][1].append(float(trade['price']))
+        self.buy_markers.setData(*markers['BUY']); self.sell_markers.setData(*markers['SELL'])
         self.chart.setXRange(now - window, now, padding=0)
         self.chart.enableAutoRange(axis='y', enable=True)
         average = self._average_prices.get(self._chart_market, 0)

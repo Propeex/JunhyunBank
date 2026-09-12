@@ -489,8 +489,23 @@ class MicroFlowStrategy:
         if market in self._blocked_after_exit and quality < 0.45:
             self._blocked_after_exit.discard(market)
         expected_move = f["expected_move"]
+        move_window = max(1, self.config.expected_move_window_seconds)
         spread = f["spread_pct"]
         cost = max(0.0, bid_fee) + max(0.0, ask_fee) + spread * 1.5
+        # Use the shortest observed horizon that covers the same cost gate.
+        # Longer horizons need at least one full window of historical returns.
+        if expected_move <= cost * 2.0:
+            frames = self._series(market)
+            for window in (60, 120):
+                if window <= move_window:
+                    continue
+                returns = [abs(r) for r in self._returns(frames, window) if math.isfinite(r)]
+                if len(returns) < window:
+                    continue
+                observed = _quantile(returns[-900:], .70)
+                if observed > cost * 2.0:
+                    expected_move, move_window = observed, window
+                    break
         if expected_move <= cost * 2.0:
             return StrategyDecision(
                 Signal.HOLD,
@@ -554,10 +569,10 @@ class MicroFlowStrategy:
         ]
         typical = statistics.median(one) if one else expected_move / 60.0
         horizon = max(
-            20.0, min(600.0, expected_move / max(typical, 1e-6))
+            float(move_window), min(600.0, expected_move / max(typical, 1e-6))
         )
         reason = (
-            f"{kind.value}: Q={quality:.3f}, "
+            f"{kind.value} · {move_window}초 관측: Q={quality:.3f}, "
             f"Activity={f['activity_q']:.2f}, "
             f"Agg={f['aggression_q']:.2f}, "
             f"Book={f['book_q']:.2f}, "
