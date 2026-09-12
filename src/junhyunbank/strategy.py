@@ -268,9 +268,7 @@ class MicroFlowStrategy:
         total = frame.bid_value + frame.ask_value
         return (frame.bid_value - frame.ask_value) / total if total else 0.0
 
-    @synchronized
-    def _feature_set(self, market: str) -> dict[str, float] | None:
-        frames = self._series(market)
+    def _trade_features(self, frames: list[SecondFrame]) -> dict[str, float] | None:
         if len(frames) < self.config.min_warmup_seconds:
             return None
         aw = max(2, self.config.activity_window_seconds)
@@ -311,6 +309,18 @@ class MicroFlowStrategy:
             else 0.0
         )
 
+        return dict(activity_q=activity_q, aggression_q=aggression_q,
+                    momentum_q=momentum_q, aggression=aggression,
+                    short_return=short_now, long_return=long_now)
+
+    @synchronized
+    def _feature_set(self, market: str) -> dict[str, float] | None:
+        frames = self._series(market)
+        trade = self._trade_features(frames)
+        if trade is None:
+            return None
+        activity_q, aggression_q, momentum_q = (trade[k] for k in ('activity_q', 'aggression_q', 'momentum_q'))
+        aggression, short_now, long_now = (trade[k] for k in ('aggression', 'short_return', 'long_return'))
         book = self._books.get(market)
         imbalance = micro_bias = 0.0
         spread_pct = 1.0
@@ -393,7 +403,9 @@ class MicroFlowStrategy:
         freshness_limit = max(5.0, self.config.activity_window_seconds * 2.0)
         if self.trade_age(market) > freshness_limit:
             return 0.0
-        f = self._feature_set(market)
+        # A detached frame snapshot keeps ranking arithmetic off the ingestion
+        # lock. Ranking uses no book, expected-move or volatility calculation.
+        f = self._trade_features(self._series(market))
         if not f:
             return 0.0
         return (

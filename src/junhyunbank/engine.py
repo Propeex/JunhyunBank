@@ -7,6 +7,8 @@ import time
 from datetime import datetime
 from typing import Any
 
+from . import __version__
+
 from .config import AppConfig
 from .execution import OrderExecution
 from .health import StrategyHealthGovernor
@@ -37,6 +39,8 @@ class TradingEngine(OrderExecution):
         self._deep_entered_at: dict[str, float] = {}
         self._latest_prices: dict[str, float] = {}
         self._last_price_ui_emit: dict[str, float] = {}
+        self._scan_seconds = self._evaluation_seconds = 0.0
+        self._last_runtime_sample = 0.0
         self._order_lock = threading.Lock()
         self._fee_cache: dict[str, tuple[float, float, float, float, float]] = {}
         self._session_start_equity: float | None = None
@@ -74,6 +78,8 @@ class TradingEngine(OrderExecution):
         self._entry_messages.clear()
         self._fee_cache.clear()
         self._last_price_ui_emit.clear()
+        self._scan_seconds = self._evaluation_seconds = 0.0
+        self._last_runtime_sample = 0.0
         self._market_discovery_retry_at = 0.0
         self._market_discovery_ready = False
         self.risk.reset_session()
@@ -86,7 +92,7 @@ class TradingEngine(OrderExecution):
         self._state = EngineState.RUNNING
         self._thread = threading.Thread(target=self._run, name="trading-engine", daemon=True)
         self._thread.start()
-        self._emit("status", "LIVE 자동매매 시작")
+        self._emit("status", f"LIVE 자동매매 시작 · V{__version__}", version=__version__)
 
     def request_stop(self) -> None:
         if not self.running:
@@ -281,6 +287,8 @@ class TradingEngine(OrderExecution):
         trade_age = max(global_ages) if global_ages else float("inf")
         deep_connected = bool(self._deep_stream and self._deep_stream.connected)
         deep_age = self._deep_stream.age_seconds if self._deep_stream else float("inf")
+        limit = self.config.safety.market_data_stale_seconds
+        fresh_deep = sum(self.strategy.trade_age(m) <= limit and self.strategy.book_age(m) <= limit for m in self._deep_markets)
         self.events.put(
             {
                 "type": "runtime_health",
@@ -295,8 +303,21 @@ class TradingEngine(OrderExecution):
                 "allowed_markets": len(self._allowed_markets),
                 "candidate_count": len(ranked),
                 "elapsed": max(0.0, time.monotonic() - self._run_started_at),
+                "scan_seconds": self._scan_seconds,
+                "evaluation_seconds": self._evaluation_seconds,
+                "fresh_deep_markets": fresh_deep,
             }
         )
+        now = time.monotonic()
+        if now - self._last_runtime_sample >= 60.0:
+            self._last_runtime_sample = now
+            self._emit('runtime_sample',
+                       f'처리 상태: 최신 체결·호가 {fresh_deep}/{len(self._deep_markets)}개 · 후보 계산 {self._scan_seconds:.3f}초 · 주문 판단 {self._evaluation_seconds:.3f}초',
+                       version=__version__, scan_seconds=self._scan_seconds,
+                       evaluation_seconds=self._evaluation_seconds, fresh_deep_markets=fresh_deep,
+                       deep_markets=len(self._deep_markets), trade_age=self._finite_age(trade_age),
+                       book_age=self._finite_age(deep_age), global_connected=global_connected,
+                       deep_connected=deep_connected, warmed_markets=warmed)
 
     def _run(self) -> None:
         next_market_refresh = next_candidate_refresh = next_evaluation = next_portfolio = next_runtime_health = 0.0
@@ -311,7 +332,9 @@ class TradingEngine(OrderExecution):
                         self.risk.report_api_failure(); self._emit("warning", f"시장 목록 갱신 실패: {exc}")
                     next_market_refresh = now + (self.config.strategy.market_refresh_seconds if getattr(self, '_market_discovery_ready', True) else 10.0)
                 if now >= next_candidate_refresh:
+                    scan_started = time.monotonic()
                     last_ranked = self.strategy.rank_markets(self._allowed_markets, self.config.strategy.scanner_candidate_count)
+                    self._scan_seconds = time.monotonic() - scan_started
                     deep = self._select_deep_markets(last_ranked)
                     self._restart_deep_stream(deep)
                     top = last_ranked[:12]
@@ -334,7 +357,10 @@ class TradingEngine(OrderExecution):
                     self._publish_runtime_health(last_ranked)
                     next_runtime_health = now + self.config.strategy.runtime_health_seconds
                 if now >= next_evaluation:
-                    self._evaluate_cycle(); next_evaluation = now + self.config.strategy.evaluation_seconds
+                    evaluation_started = time.monotonic()
+                    self._evaluate_cycle()
+                    self._evaluation_seconds = time.monotonic() - evaluation_started
+                    next_evaluation = now + self.config.strategy.evaluation_seconds
                 if now >= next_portfolio:
                     try:
                         self._publish_portfolio()
