@@ -127,7 +127,7 @@ class MainWindow(QMainWindow):
         right.addWidget(chart_box, 3); body.addLayout(right, 3); layout.addLayout(body, 1); self.setCentralWidget(root)
         self.api_button.clicked.connect(self.configure_api); self.update_button.clicked.connect(self.check_for_update); self.start_button.clicked.connect(self.start_trading); self.stop_button.clicked.connect(self.stop_trading); self.emergency_button.clicked.connect(self.emergency_stop)
         self.timer = QTimer(self); self.timer.timeout.connect(self.poll_events); self.timer.start(200); self._sync_buttons()
-        self._activity_event(self.engine.storage.activity_snapshot())
+        self.engine._publish_activity()
 
     def _sync_buttons(self) -> None:
         running = self.engine.running; draining = self.engine.state == EngineState.DRAINING
@@ -266,6 +266,10 @@ class MainWindow(QMainWindow):
                 metrics += f" / 필요 > {detail.get('cost_pct', 0) * 2:.3%}"
             if 'trade_age' in detail:
                 metrics += f" · 체결 {self._age_text(detail['trade_age'])} / 호가 {self._age_text(detail.get('book_age'))}"
+            if 'amount_krw' in detail:
+                metrics += f" · 계산 주문 {detail['amount_krw']:,.0f}원"
+            if 'min_order_krw' in detail:
+                metrics += f" / 최소 {detail['min_order_krw']:,.0f}원 / 사용 가능 {detail.get('available_cash', 0):,.0f}원"
             lines.append(f"{market}: {detail['reason']}{metrics}")
         text = '\n'.join(lines)
         if self.entry_diagnostics.toPlainText() != text:
