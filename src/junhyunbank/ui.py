@@ -177,6 +177,7 @@ class MainWindow(QMainWindow):
         trade_age = self._age_text(event.get("trade_age")); deep_age = self._age_text(event.get("deep_age")) if deep_count else "후보 대기"
         deep_state = "연결" if deep_connected else ("대기" if deep_count == 0 else "재연결")
         self.data_health.setText(f"데이터: Trade WS {global_connected}/{global_total} · 마지막 체결 {trade_age} · 추적 {tracked}/{allowed} · 워밍업 완료 {warmed} · 후보 {candidates} · Orderbook {deep_state}({deep_count}) / {deep_age}")
+        self.data_health.setText(self.data_health.text() + f"\n최신 체결·호가 {event.get('fresh_deep_markets', 0)}/{deep_count}개 · 후보 계산 {float(event.get('scan_seconds', 0)):.2f}초 · 주문 판단 {float(event.get('evaluation_seconds', 0)):.2f}초")
         if not candidates and float(event.get("elapsed", 0.0)) < 180.0:
             self.candidates.setText(f"전략 워밍업 중 · 실시간 가격 추적 {tracked}개 시장")
 
@@ -217,7 +218,7 @@ class MainWindow(QMainWindow):
                 message = str(event.get("message", ""))
                 if message:
                     self.log.append(f"[{event_type}] {message}")
-                    if event_type != 'entry_wait': self.status.setText(message)
+                    if event_type not in {'entry_wait', 'runtime_sample'}: self.status.setText(message)
                 if event_type in {"stopped", "drain_complete", "emergency"}: self._sync_buttons()
                 if event_type == "drain_complete" and self._close_when_drained: self._close_when_drained = False; QTimer.singleShot(250, self.close)
         lines = []
