@@ -147,7 +147,7 @@ class MainWindow(QMainWindow):
             self._entry_diagnostics.clear()
             self._position_diagnostics.clear()
             self.entry_diagnostics.clear()
-            self.data_health.setText("데이터: WebSocket 연결 중 · 전략 워밍업은 기본 약 3분입니다.")
+            self.data_health.setText("데이터 연결 중 · 최소 3분의 체결 이력이 필요하며, 거래가 뜸한 종목은 더 걸릴 수 있습니다.")
             self.engine.start(); self._sync_buttons()
         except Exception as exc: QMessageBox.critical(self, "시작 실패", str(exc))
 
@@ -201,7 +201,8 @@ class MainWindow(QMainWindow):
         tracked = int(event.get("tracked_markets", 0)); warmed = int(event.get("warmed_markets", 0)); allowed = int(event.get("allowed_markets", 0)); candidates = int(event.get("candidate_count", 0))
         trade_age = self._age_text(event.get("trade_age")); deep_age = self._age_text(event.get("deep_age")) if deep_count else "후보 대기"
         deep_state = "연결" if deep_connected else ("대기" if deep_count == 0 else "재연결")
-        self.data_health.setText(f"데이터: Trade WS {global_connected}/{global_total} · 마지막 체결 {trade_age} · 추적 {tracked}/{allowed} · 워밍업 완료 {warmed} · 후보 {candidates} · Orderbook {deep_state}({deep_count}) / {deep_age}")
+        ready = int(event.get('history_ready_markets', warmed))
+        self.data_health.setText(f"데이터: Trade WS {global_connected}/{global_total} · 마지막 체결 {trade_age} · 추적 {tracked}/{allowed} · 기준 이력 확보 {ready}개 (최근 30초 체결 {warmed}개) · 후보 {candidates} · Orderbook {deep_state}({deep_count}) / {deep_age}")
         self.data_health.setText(self.data_health.text() + f"\n최신 체결·호가 {event.get('fresh_deep_markets', 0)}/{deep_count}개 · 후보 계산 {float(event.get('scan_seconds', 0)):.2f}초 · 주문 판단 {float(event.get('evaluation_seconds', 0)):.2f}초")
         if not candidates and float(event.get("elapsed", 0.0)) < 180.0:
             self.candidates.setText(f"전략 워밍업 중 · 실시간 가격 추적 {tracked}개 시장")

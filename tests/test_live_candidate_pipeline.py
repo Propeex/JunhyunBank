@@ -128,3 +128,127 @@ def test_candidate_ui_event_is_rewritten_to_actionable_fresh_ranking():
     assert event["prices"] == {"KRW-B": 123.0}
     assert event["stale_skipped"] == 3
     assert event["supplemented"] == 1
+
+
+def test_mature_fresh_incumbent_survives_below_margin_challenger():
+    engine = _engine(ages={'KRW-A': .1, 'KRW-B': .1}, scores={'KRW-A': 80, 'KRW-B': 81})
+    engine.config.strategy.deep_candidate_count = 1
+    engine._deep_markets = ['KRW-A']
+    engine._deep_entered_at = {'KRW-A': time.monotonic() - 31}
+    assert engine._select_deep_markets([('KRW-B', 81), ('KRW-A', 80)]) == ['KRW-A']
+
+
+def test_challenger_must_wait_for_residency_then_meet_margin():
+    engine = _engine(ages={'KRW-A': .1, 'KRW-B': .1}, scores={'KRW-A': 80, 'KRW-B': 84})
+    engine.config.strategy.deep_candidate_count = 1
+    engine._deep_markets = ['KRW-A']
+    engine._deep_entered_at = {'KRW-A': time.monotonic() - 5}
+    ranked = [('KRW-B', 84), ('KRW-A', 80)]
+    assert engine._select_deep_markets(ranked) == ['KRW-A']
+    engine._deep_entered_at['KRW-A'] = time.monotonic() - 31
+    assert engine._select_deep_markets(ranked) == ['KRW-B']
+
+
+def test_incumbent_outside_truncated_ranking_uses_its_actual_score():
+    engine = _engine(ages={'KRW-A': .1, 'KRW-B': .1}, scores={'KRW-A': 80, 'KRW-B': 81})
+    engine.config.strategy.scanner_candidate_count = 1
+    engine.config.strategy.deep_candidate_count = 1
+    engine._deep_markets = ['KRW-A']
+    engine._deep_entered_at = {'KRW-A': time.monotonic() - 31}
+    assert engine._select_deep_markets([('KRW-B', 81)]) == ['KRW-A']
+
+
+def test_idle_incumbent_uses_only_spare_capacity_and_expires():
+    engine = _engine(ages={'KRW-IDLE': 4, 'KRW-FRESH': .1}, scores={'KRW-IDLE': 99, 'KRW-FRESH': 70})
+    engine._deep_markets = ['KRW-IDLE']
+    engine._deep_entered_at = {'KRW-IDLE': time.monotonic()}
+    ranked = [('KRW-FRESH', 70)]
+    assert engine._select_deep_markets(ranked) == ['KRW-FRESH', 'KRW-IDLE']
+    assert engine._actionable_ranked == (('KRW-FRESH', 70),)
+    engine.strategy.ages['KRW-IDLE'] = 31
+    assert engine._select_deep_markets(ranked) == ['KRW-FRESH']
+
+
+def test_fresh_candidate_immediately_takes_idle_slot_regardless_of_residency():
+    engine = _engine(ages={'KRW-IDLE': 4, 'KRW-FRESH': .1}, scores={'KRW-IDLE': 99, 'KRW-FRESH': 70})
+    engine.config.strategy.deep_candidate_count = 1
+    engine._deep_markets = ['KRW-IDLE']
+    engine._deep_entered_at = {'KRW-IDLE': time.monotonic()}
+    assert engine._select_deep_markets([('KRW-FRESH', 70)]) == ['KRW-FRESH']
+
+
+def test_shrinking_deep_limit_bounds_nonmanaged_slots_and_keeps_managed():
+    engine = _engine(
+        ages={'KRW-A': .1, 'KRW-B': .1, 'KRW-C': .1, 'KRW-D': 4, 'KRW-M': 100},
+        scores={'KRW-A': 70, 'KRW-B': 90, 'KRW-C': 80, 'KRW-D': 99, 'KRW-M': 10},
+        managed={'KRW-M'},
+    )
+    engine._deep_markets = ['KRW-A', 'KRW-B', 'KRW-C', 'KRW-D', 'KRW-M']
+    engine._deep_entered_at = {market: time.monotonic() for market in engine._deep_markets}
+    selected = engine._select_deep_markets([('KRW-B', 90), ('KRW-C', 80), ('KRW-A', 70)])
+    assert selected == ['KRW-B', 'KRW-C', 'KRW-M']
+
+
+def test_short_trade_lull_preserves_actual_subscription_and_book_history(monkeypatch):
+    import junhyunbank.runtime_engine as runtime
+    from junhyunbank.strategy import MicroFlowStrategy
+
+    class FakeStream:
+        def __init__(self, markets, **kwargs):
+            self.markets = markets
+            self.updates = []
+            self.stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+
+        def update_markets(self, markets):
+            self.updates.append(markets)
+
+    monkeypatch.setattr(runtime, 'MarketStream', FakeStream)
+    engine = _engine(ages={}, scores={'KRW-X': 90})
+    engine.strategy = MicroFlowStrategy(engine.config.strategy)
+    engine._deep_stream = None
+    engine._restart_deep_stream(['KRW-X'])
+    stream = engine._deep_stream
+    history = [(second, .5, .0001) for second in range(12)]
+    engine.strategy._book_history['KRW-X'].extend(history)
+    engine.strategy._last_trade_received['KRW-X'] = time.monotonic() - 4
+
+    engine._restart_deep_stream(engine._select_deep_markets([]))
+    assert engine._actionable_ranked == ()
+    assert engine._deep_stream is stream and not stream.stopped and stream.updates == []
+    assert list(engine.strategy._book_history['KRW-X']) == history
+
+    engine.strategy._last_trade_received['KRW-X'] = time.monotonic()
+    engine._restart_deep_stream(engine._select_deep_markets([('KRW-X', 90)]))
+    assert engine._actionable_ranked == (('KRW-X', 90),)
+    assert engine._deep_stream is stream and stream.updates == []
+    assert list(engine.strategy._book_history['KRW-X']) == history
+
+
+def test_retained_idle_market_cannot_submit_stale_buy(tmp_path, monkeypatch):
+    from junhyunbank.models import EngineState, Signal
+    from junhyunbank.storage import Storage
+    from test_entry_pipeline import Exchange, feed
+
+    client = Exchange()
+    engine = TradingEngine(client, storage=Storage(tmp_path / 'idle.db'))
+    engine._state = EngineState.RUNNING
+    engine._allowed_markets = ['KRW-X']
+    engine._deep_markets = ['KRW-X']
+    engine._deep_entered_at = {'KRW-X': time.monotonic() - 5}
+    feed(engine.strategy)
+    assert engine.strategy.evaluate_entry('KRW-X', bid_fee=.0005, ask_fee=.0005,
+                                          health=1, regime_factor=1).signal == Signal.BUY
+    monkeypatch.setattr(engine.strategy, 'trade_age', lambda market: 4)
+    engine._deep_markets = engine._select_deep_markets([])
+    assert engine._deep_markets == ['KRW-X'] and engine._actionable_ranked == ()
+
+    engine._evaluate_cycle()
+
+    assert client.orders == [] and engine.storage.pending_orders() == []
+    assert any('지연' in event.get('reason', '') for event in engine.drain_events())

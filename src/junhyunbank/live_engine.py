@@ -37,7 +37,7 @@ class TradingEngine(RuntimeTradingEngine):
     def _select_deep_markets(
         self, ranked: list[tuple[str, float]]
     ) -> list[str]:
-        """Use only entry-fresh scanner candidates for scarce deep slots.
+        """Prioritize entry-fresh candidates while preserving useful observations.
 
         ``MicroFlowStrategy.hot_score`` deliberately tolerates a somewhat wider
         trade-age window for scanner stability. The live entry gate is stricter
@@ -50,8 +50,10 @@ class TradingEngine(RuntimeTradingEngine):
         We first remove candidates that cannot pass the live freshness gate, then
         fill the resulting holes from fresh markets outside the truncated scanner
         top-N. The strategy score/quality/cost thresholds themselves are not
-        relaxed. Existing managed positions remain in the deep set regardless of
-        entry freshness because exits must continue to be monitored.
+        relaxed. Briefly idle incumbents can retain otherwise unused slots, but
+        never displace fresh candidates or become actionable without a new trade.
+        Existing managed positions remain in the deep set regardless of entry
+        freshness because exits must continue to be monitored.
         """
         now = time.monotonic()
         stale_limit = max(0.1, float(self.config.safety.market_data_stale_seconds))
@@ -111,18 +113,22 @@ class TradingEngine(RuntimeTradingEngine):
         scores = dict(deduped)
         selected: list[str] = sorted(managed)
 
-        # Preserve anti-churn residency only while an entry candidate is still
-        # fresh enough to be actionable. Stale non-managed candidates are
-        # deliberately not carried forward, even if their 30-second residency
-        # has not elapsed.
+        # Keep fresh incumbents until the replacement comparison below. Removing
+        # mature incumbents here would bypass the score-margin condition entirely.
+        incumbents: list[str] = []
         for market in self._deep_markets:
-            if market in managed or market not in self._allowed_markets:
+            if market in managed or market not in self._allowed_markets or market in incumbents:
                 continue
             if self.strategy.trade_age(market) > stale_limit:
                 continue
-            age = now - self._deep_entered_at.get(market, now)
-            if market in desired or age < self.config.strategy.deep_min_residency_seconds:
-                selected.append(market)
+            if market not in scores:
+                # A truncated scanner list is not evidence of a zero score.
+                scores[market] = float(self.strategy.hot_score(market))
+            incumbents.append(market)
+        if len(incumbents) > deep_limit:
+            # A changed configuration can shrink the limit during a run.
+            incumbents.sort(key=lambda market: (market in desired, scores[market]), reverse=True)
+        selected.extend(incumbents[:deep_limit])
 
         def nonmanaged_count() -> int:
             return sum(1 for market in selected if market not in managed)
@@ -150,6 +156,23 @@ class TradingEngine(RuntimeTradingEngine):
             ):
                 selected.remove(weakest)
                 selected.append(market)
+
+        # A brief trade lull must not discard ten seconds of valid book history
+        # when there is no competing fresh candidate. Retention is bounded by
+        # time since the last trade, and these markets remain outside actionable
+        # ranking; the unchanged entry/order freshness checks still reject them.
+        idle_limit = max(stale_limit, float(self.config.strategy.deep_min_residency_seconds))
+        idle_incumbents = [
+            market for market in dict.fromkeys(self._deep_markets)
+            if market not in managed and market not in selected
+            and market in self._allowed_markets
+            and stale_limit < self.strategy.trade_age(market) <= idle_limit
+        ]
+        idle_incumbents.sort(key=self.strategy.trade_age)
+        for market in idle_incumbents:
+            if nonmanaged_count() >= deep_limit:
+                break
+            selected.append(market)
 
         if (
             not deduped
