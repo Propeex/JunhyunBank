@@ -290,11 +290,12 @@ class TradingEngine(OrderExecution):
     def _publish_runtime_health(self, ranked: list[tuple[str, float]]) -> None:
         self._publish_activity()
         tracked = sum(1 for market in self._allowed_markets if self.strategy.latest_price(market))
-        warmed = sum(
-            1
+        history_ready = [
+            market
             for market in self._allowed_markets
-            if self.strategy.warmup_ratio(market) >= 1.0 and self.strategy.trade_age(market) <= 30.0
-        )
+            if self.strategy.warmup_ratio(market) >= 1.0
+        ]
+        warmed = sum(self.strategy.trade_age(market) <= 30.0 for market in history_ready)
         global_total = len(self._global_streams)
         global_connected = sum(1 for stream in self._global_streams if stream.connected)
         global_ages = [stream.age_seconds for stream in self._global_streams]
@@ -314,6 +315,7 @@ class TradingEngine(OrderExecution):
                 "deep_markets": len(self._deep_markets),
                 "tracked_markets": tracked,
                 "warmed_markets": warmed,
+                "history_ready_markets": len(history_ready),
                 "allowed_markets": len(self._allowed_markets),
                 "candidate_count": len(ranked),
                 "elapsed": max(0.0, time.monotonic() - self._run_started_at),
@@ -331,7 +333,8 @@ class TradingEngine(OrderExecution):
                        evaluation_seconds=self._evaluation_seconds, fresh_deep_markets=fresh_deep,
                        deep_markets=len(self._deep_markets), trade_age=self._finite_age(trade_age),
                        book_age=self._finite_age(deep_age), global_connected=global_connected,
-                       deep_connected=deep_connected, warmed_markets=warmed)
+                       deep_connected=deep_connected, warmed_markets=warmed,
+                       history_ready_markets=len(history_ready))
 
     def _run(self) -> None:
         next_market_refresh = next_candidate_refresh = next_evaluation = next_portfolio = next_runtime_health = 0.0
