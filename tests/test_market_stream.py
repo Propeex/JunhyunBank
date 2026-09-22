@@ -1,8 +1,9 @@
 import json
+import time
 
 import websocket
 
-from junhyunbank.market_stream import MarketStream
+from junhyunbank.market_stream import MarketStream, TRANSPORT_AGE_SECONDS_KEY
 
 
 def test_public_websocket_connection_suppresses_origin(monkeypatch):
@@ -81,3 +82,107 @@ def test_upbit_error_payload_is_not_treated_as_market_data():
         == "Too Many Requests: rate limited"
     )
     assert MarketStream._server_error({"type": "trade"}) is None
+
+
+def test_public_event_timestamp_classifier_fails_closed_for_old_future_and_invalid():
+    now = 1_700_000_000.0
+
+    assert MarketStream.classify_event_timestamp(
+        {"type": "trade", "trade_timestamp": int((now - 2.9) * 1000)},
+        now_wall=now,
+        max_lag_seconds=3.0,
+        max_future_seconds=2.0,
+    ) == "ok"
+    assert MarketStream.classify_event_timestamp(
+        {"type": "trade", "trade_timestamp": int((now - 3.1) * 1000)},
+        now_wall=now,
+        max_lag_seconds=3.0,
+        max_future_seconds=2.0,
+    ) == "stale"
+    assert MarketStream.classify_event_timestamp(
+        {"type": "orderbook", "timestamp": int((now + 2.1) * 1000)},
+        now_wall=now,
+        max_lag_seconds=3.0,
+        max_future_seconds=2.0,
+    ) == "invalid"
+    assert MarketStream.classify_event_timestamp(
+        {"type": "trade", "trade_timestamp": "not-a-timestamp"},
+        now_wall=now,
+    ) == "invalid"
+    assert MarketStream.classify_event_timestamp(
+        {"type": "trade"}, now_wall=now
+    ) == "invalid"
+
+
+def test_dropped_public_frame_does_not_advance_freshness_or_callback(monkeypatch):
+    received = []
+    statuses = []
+    errors = []
+    stream = MarketStream(
+        ["KRW-BTC"],
+        on_trade=received.append,
+        on_status=statuses.append,
+        on_error=errors.append,
+    )
+    stream._last_message = 123.0
+    monkeypatch.setattr(
+        "junhyunbank.market_stream.time.time", lambda: 1_700_000_000.0
+    )
+    monkeypatch.setattr("junhyunbank.market_stream.time.monotonic", lambda: 500.0)
+
+    stale = {
+        "type": "trade",
+        "code": "KRW-BTC",
+        "trade_timestamp": 1_699_999_990_000,
+    }
+    assert stream._handle_market_event(stale) is False
+
+    assert received == []
+    assert stream._last_message == 123.0
+    assert stream._message_count == 0
+    assert stream._stale_drop_count == 1
+    assert stream._invalid_drop_count == 0
+    assert errors and "stale" in errors[-1]
+    assert statuses[-1]["state"] == "data_dropped"
+    assert statuses[-1]["market_codes"] == ["KRW-BTC"]
+    assert statuses[-1]["stale_drops"] == 1
+    assert statuses[-1]["invalid_drops"] == 0
+
+
+def test_valid_public_frame_preserves_transport_age_and_overwrites_metadata(monkeypatch):
+    received = []
+    stream = MarketStream(["KRW-BTC"], on_trade=received.append)
+    monkeypatch.setattr(
+        "junhyunbank.market_stream.time.time", lambda: 1_700_000_000.0
+    )
+    monkeypatch.setattr("junhyunbank.market_stream.time.monotonic", lambda: 500.0)
+    event = {
+        "type": "trade",
+        "code": "KRW-BTC",
+        "trade_timestamp": 1_699_999_997_250,
+        TRANSPORT_AGE_SECONDS_KEY: 0.0,
+    }
+
+    assert stream._handle_market_event(event) is True
+    assert received == [event]
+    assert abs(event[TRANSPORT_AGE_SECONDS_KEY] - 2.75) < 1e-9
+    assert abs(stream._last_message - 497.25) < 1e-9
+    assert abs(stream.age_seconds - 2.75) < 1e-9
+    assert stream._message_count == 1
+
+
+def test_stream_status_includes_market_codes_and_drop_counters():
+    statuses = []
+    stream = MarketStream(
+        ["KRW-BTC", "KRW-ETH"],
+        on_trade=lambda event: None,
+        on_status=statuses.append,
+    )
+    stream._stale_drop_count = 2
+    stream._invalid_drop_count = 3
+
+    stream._emit_status("connecting")
+
+    assert statuses[-1]["market_codes"] == ["KRW-BTC", "KRW-ETH"]
+    assert statuses[-1]["stale_drops"] == 2
+    assert statuses[-1]["invalid_drops"] == 3

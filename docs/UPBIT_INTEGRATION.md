@@ -1,6 +1,6 @@
 # Upbit 연동 규칙과 전제
 
-기준 재확인일: **2026-09-11 / V4.0.6**
+기준 재확인일: **2026-09-12 / V4.3.0**
 
 Upbit API는 변경될 수 있으므로 주문·인증·Rate Limit·WebSocket 코드를 수정하기 전에는 최신 공식 문서를 다시 확인한다. 코드와 이 문서가 충돌하면 최신 공식 Upbit 사양을 확인한 뒤 둘을 함께 수정한다.
 
@@ -55,7 +55,9 @@ KRW available/locked, coin balance/locked/avg_buy_price, portfolio reconciliatio
 GET /v1/market/all?is_details=true
 ```
 
-KRW universe와 `market_event` warning/caution을 확인한다. 상세 필드가 없는 호환 응답에는 legacy `isDetails=true`를 한 번 재시도할 수 있다.
+KRW universe와 `market_event` warning/caution을 확인한다. 상세 필드가 없는 호환 응답에는 legacy `isDetails=true`를 한 번 재시도할 수 있다. 중복 market 행은 warning > unknown > normal의 최악 상태로 합치고, `warning`/`caution`의 `null`·누락·미확인 형식은 unknown으로 제외한다.
+
+성공 응답도 완전하다고 가정하지 않는다. `KRW-BTC`는 원본과 안전 허용목록 모두에 있어야 하고, 원본 KRW 시장과 안전 허용시장도 각각 최소 50개여야 한다. 직전 안전목록의 70% 미만으로 급감하거나 unknown 비율이 5%를 초과하는 것도 각각 독립적인 실패 조건이다. 하나라도 실패하면 기존 구독은 관리 포지션 청산용으로 유지하지만 정상 discovery 전까지 신규매수는 막는다.
 
 ### ticker fallback
 
@@ -64,6 +66,14 @@ GET /v1/ticker?markets=KRW-BTC,...
 ```
 
 portfolio 조회 시 아직 Public WS current price가 없는 보유자산의 가격 fallback에 사용한다.
+
+### orderbook fallback
+
+```text
+GET /v1/orderbook?markets=KRW-BTC,...
+```
+
+관리 포지션의 live book이 stale일 때 청산 판단용 fresh best bid를 보조 조회한다. REST 호가의 local receive 시각은 요청 시작이 아니라 응답을 받은 뒤 기록하고, exchange timestamp가 stale이면 사용하지 않는다. 오래된 마지막 체결가를 fresh 실행가격처럼 취급하지 않는다.
 
 ### 주문 가능 정보
 
@@ -101,6 +111,7 @@ market        = KRW-XXX
 side          = bid
 ord_type      = best
 time_in_force = ioc
+smp_type      = cancel_taker
 price         = <KRW quote amount>
 identifier    = junhyunbank-<uuid>
 ```
@@ -113,6 +124,7 @@ market        = KRW-XXX
 side          = ask
 ord_type      = best
 time_in_force = ioc
+smp_type      = cancel_taker
 volume        = <coin quantity>
 identifier    = junhyunbank-<uuid>
 ```
@@ -136,6 +148,8 @@ V4.0.6부터 live pre-trade model도 이 의미를 따른다. 현재 신규 포�
 
 호가는 주문 전송/접수 사이에도 변할 수 있으므로 실제 partial/no fill 가능성은 사라지지 않는다. 실제 결과는 identifier REST reconciliation과 partial-fill accounting으로 확정한다.
 
+`cancel_taker`는 같은 계정의 기존 maker 주문과 자기체결 위험이 생기면 새 taker 주문 쪽을 취소하도록 요청한다. 자기체결방지는 가격변동, 다른 참여자 체결, partial/no-fill을 방지하는 기능이 아니다.
+
 ## 5. Emergency Stop 매도 fallback
 
 일반 청산은 Best+IOC다. Emergency Stop 청산에서 Best+IOC가 **terminal이며 executed volume이 0**으로 확인된 경우에만 시장가 매도를 fallback으로 사용할 수 있다.
@@ -158,11 +172,13 @@ junhyunbank-<uuid>
 
 V4는 POST 전 identifier와 주문 의도를 SQLite `order_intents`에 먼저 저장한다.
 
+- POST 시도 직전 `submitted_at`, 거래소 UUID 수신 직후 `accepted_at`을 기록한다.
 - POST timeout/5xx/응답 유실에서 같은 주문을 재전송하지 않는다.
 - identifier로 결과를 조회한다.
 - terminal 확인 전 같은 시장 중복 주문을 막는다.
 - 재시작 뒤 pending intent를 다시 reconciliation한다.
 - partial fill은 실제 trades/fee만 원자적으로 반영한다.
+- 정지 요청과 POST는 공통 submission gate로 직렬화한다. BUY는 POST 직전 market 허용/discovery, 전체 trade shard, 해당 trade/orderbook freshness를 gate 안에서 다시 확인한다.
 
 ## 7. Public WebSocket — trade
 
@@ -181,7 +197,7 @@ trade
 - `trade_timestamp` / `timestamp`
 - `sequential_id` 가능 시 recorder 저장
 
-`ask_bid == BID`는 공격적 매수 체결, `ASK`는 공격적 매도 체결로 집계한다. 역순 exchange-second event가 현재 frame을 훼손하지 않게 방어한다.
+`ask_bid == BID`는 공격적 매수 체결, `ASK`는 공격적 매도 체결로 집계한다. 비유한 값, timestamp 누락/지연/미래, sequence 역행과 중복 event는 가격·frame·freshness에 반영하지 않는다.
 
 ## 8. Public WebSocket — orderbook
 
@@ -191,7 +207,7 @@ trade
 orderbook
 ```
 
-live runtime은 Hot 후보와 managed positions를 deep subscription에 포함한다. V3 이후 후보 변경 때 socket 전체를 매번 끊지 않고 subscription set을 갱신한다.
+live runtime은 공용 fresh actionable 선택기로 고른 후보와 managed positions를 deep subscription에 포함한다. recorder와 validator도 후보 부분에는 같은 stale 제거·top-N 밖 보충·residency·switch margin 선택기를 사용한다. V3 이후 후보 변경 때 socket 전체를 매번 끊지 않고 subscription set을 갱신한다.
 
 중요 필드:
 
@@ -202,6 +218,8 @@ live runtime은 Hot 후보와 managed positions를 deep subscription에 포함�
 - `timestamp`
 
 전략은 여러 L2 level을 imbalance/microprice/liquidity 연구에 사용한다. 그러나 **현재 live Best+IOC의 즉시 체결 capacity는 최우선 level만 사용한다.** Deeper L2는 Best+IOC가 worse price로 walk할 수 있다는 뜻이 아니다.
+
+호가도 timestamp·유한값·양수·가격정렬을 검증한 뒤 상태와 freshness를 갱신한다. subscription 변경 또는 reconnect로 연속성이 끊기면 이전 history를 재사용하지 않는다.
 
 V4.0.4 recorder는 향후 execution research를 위해 더 깊은 L2를 보존할 수 있다.
 
@@ -247,15 +265,15 @@ Private stream은 장시간 이벤트가 없어도 정상일 수 있으므로 pi
 
 KRW market minimum은 `/v1/orders/chance` 응답을 우선하고 `SafetyConfig.min_order_krw`를 fallback으로 사용한다.
 
-관리 잔여수량 가치가 minimum 아래면 전체 계정잔고로 보충하거나 사용자 수량을 섞지 않는다. dust 처리 UX는 별도 개선 대상이다.
+관리 잔여수량 가치가 minimum 아래면 전체 계정잔고로 보충하거나 사용자 수량을 섞지 않고 `DUST` 상태로 보존한다. accounts에서 관리수량이 반복 누락된 상태는 `QUARANTINED`로 격리하며 자동으로 계정 총수량을 관리수량으로 바꾸지 않는다.
 
 ## 12. Rate Limit
 
 Rate Limit은 전략상의 임의 거래횟수 제한과 다르다. 거래소 운영 제약으로 항상 준수한다.
 
-endpoint group별 허용량과 정책은 변경될 수 있으므로 숫자를 코드 변경의 근거로 삼기 전에 최신 공식 문서를 확인한다. 현재 client는 private REST를 직렬화/보수적 간격으로 제한하고 429/backoff 경로를 가진다.
+endpoint group별 허용량과 정책은 변경될 수 있으므로 숫자를 코드 변경의 근거로 삼기 전에 최신 공식 문서를 확인한다. 현재 client는 private REST를 직렬화/보수적 간격으로 제한한다. GET은 timeout/429/일시적 5xx에 짧고 제한적인 backoff 재시도를 적용하지만, 주문 POST는 중복주문 위험 때문에 자동 재시도하지 않는다.
 
-- `429`: rate-limit response, retry/backoff 대상.
+- GET `429`: 제한된 retry/backoff 대상. POST `429`: 재전송하지 않고 오류 처리.
 - `418`: temporary block 성격의 오류로 취급.
 
 향후 endpoint group별 circuit breaker/token bucket으로 분리할 수 있다.

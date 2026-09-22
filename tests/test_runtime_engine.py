@@ -49,6 +49,9 @@ class _FakeStream:
 
 def _engine(tmp_path: Path, client=None) -> TradingEngine:
     config = AppConfig(strategy=StrategyConfig(deep_candidate_count=2))
+    # Small fixtures opt out of the production absolute-size floor. Sentinel,
+    # shrink and schema checks remain active in these tests.
+    config.safety.market_universe_min_size = 1
     return TradingEngine(
         client or _DummyClient(),
         config,
@@ -123,6 +126,99 @@ def test_unknown_alert_shape_fails_closed():
     assert TradingEngine._is_warning_market(row) is True
 
 
+def test_market_event_without_caution_fails_closed():
+    row = {"market": "KRW-BTC", "market_event": {"warning": False}}
+
+    flagged, understood = TradingEngine._market_alert_status(row)
+
+    assert flagged is False
+    assert understood is False
+    snapshot = TradingEngine._classify_market_universe([row])
+    assert snapshot["allowed"] == []
+    assert snapshot["unknown_count"] == 1
+
+
+def test_empty_caution_object_fails_closed():
+    row = {
+        "market": "KRW-BTC",
+        "market_event": {"warning": False, "caution": {}},
+    }
+
+    flagged, understood = TradingEngine._market_alert_status(row)
+
+    assert flagged is False
+    assert understood is False
+    assert TradingEngine._classify_market_universe([row])["allowed"] == []
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"warning": None, "caution": {}},
+        {"warning": False, "caution": {"PRICE_FLUCTUATIONS": None}},
+    ],
+)
+def test_null_alert_values_fail_closed(event):
+    row = {"market": "KRW-BTC", "market_event": event}
+
+    flagged, understood = TradingEngine._market_alert_status(row)
+
+    assert flagged is False
+    assert understood is False
+    snapshot = TradingEngine._classify_market_universe([row])
+    assert snapshot["allowed"] == []
+    assert snapshot["unknown_count"] == 1
+
+
+def test_duplicate_market_uses_worst_case_alert_status():
+    rows = [
+        {"market": "KRW-BTC", "market_event": _normal_event()},
+        {
+            "market": "KRW-BTC",
+            "market_event": _normal_event(
+                caution={"PRICE_FLUCTUATIONS": True}
+            ),
+        },
+        {"market": "KRW-ETH", "market_event": _normal_event()},
+    ]
+
+    snapshot = TradingEngine._classify_market_universe(rows)
+
+    assert snapshot["raw_krw"] == ["KRW-BTC", "KRW-ETH"]
+    assert snapshot["allowed"] == ["KRW-ETH"]
+    assert snapshot["flagged_count"] == 1
+
+
+def test_duplicate_unknown_row_cannot_be_overridden_by_normal_row():
+    rows = [
+        {"market": "KRW-BTC", "market_event": _normal_event()},
+        {"market": "KRW-BTC", "market_event": {"warning": False}},
+    ]
+
+    snapshot = TradingEngine._classify_market_universe(rows)
+
+    assert snapshot["allowed"] == []
+    assert snapshot["flagged_count"] == 0
+    assert snapshot["unknown_count"] == 1
+    assert snapshot["unknown_samples"] == ["KRW-BTC"]
+
+
+def test_initial_validation_rejects_conflicting_duplicate_btc_rows():
+    safety = AppConfig().safety
+    safety.market_universe_min_size = 1
+    rows = [
+        {"market": "KRW-BTC", "market_event": _normal_event()},
+        {
+            "market": "KRW-BTC",
+            "market_event": _normal_event(warning=True),
+        },
+        {"market": "KRW-ETH", "market_event": _normal_event()},
+    ]
+
+    with pytest.raises(RuntimeError, match="KRW-BTC가 안전 허용목록"):
+        TradingEngine.validated_initial_markets(rows, safety)
+
+
 def test_refresh_markets_builds_nonzero_krw_streams(monkeypatch, tmp_path):
     # _restart_global_streams is inherited from the base engine and resolves
     # MarketStream in junhyunbank.engine, so patch that module for this test.
@@ -170,6 +266,133 @@ def test_refresh_markets_never_silently_accepts_zero_safe_markets(tmp_path):
     # Immediate loop iterations must not hammer /v1/market/all again.
     engine._refresh_markets()
     assert client.calls == 1
+
+
+def test_refresh_markets_rejects_missing_btc_sentinel(tmp_path):
+    rows = [
+        {"market": "KRW-ETH", "market_event": _normal_event()},
+        {"market": "KRW-XRP", "market_event": _normal_event()},
+    ]
+    engine = _engine(tmp_path, _MarketClient(rows))
+
+    with pytest.raises(RuntimeError, match="KRW-BTC 누락"):
+        engine._refresh_markets()
+
+    assert engine._market_discovery_ready is False
+    assert engine._allowed_markets == []
+
+
+def test_research_universe_uses_production_initial_sanity_floor():
+    rows = [
+        {"market": "KRW-BTC", "market_event": _normal_event()},
+        {"market": "KRW-ETH", "market_event": _normal_event()},
+    ]
+
+    with pytest.raises(RuntimeError, match="최소 50개"):
+        TradingEngine.validated_initial_markets(rows, AppConfig().safety)
+
+    complete = [
+        {"market": "KRW-BTC", "market_event": _normal_event()}
+    ] + [
+        {"market": f"KRW-T{index}", "market_event": _normal_event()}
+        for index in range(49)
+    ]
+    assert len(
+        TradingEngine.validated_initial_markets(complete, AppConfig().safety)
+    ) == 50
+
+
+def test_initial_universe_requires_safe_btc_and_enough_safe_markets():
+    safety = AppConfig().safety
+    rows = [
+        {
+            "market": "KRW-BTC",
+            "market_event": _normal_event(
+                caution={"PRICE_FLUCTUATIONS": True}
+            ),
+        }
+    ] + [
+        {"market": f"KRW-T{index}", "market_event": _normal_event()}
+        for index in range(60)
+    ]
+    with pytest.raises(RuntimeError, match="KRW-BTC가 안전 허용목록"):
+        TradingEngine.validated_initial_markets(rows, safety)
+
+    too_few_safe = [
+        {"market": "KRW-BTC", "market_event": _normal_event()}
+    ] + [
+        {"market": f"KRW-S{index}", "market_event": _normal_event()}
+        for index in range(39)
+    ] + [
+        {
+            "market": f"KRW-R{index}",
+            "market_event": _normal_event(
+                caution={"TRADING_VOLUME_SOARING": True}
+            ),
+        }
+        for index in range(20)
+    ]
+    with pytest.raises(RuntimeError, match="안전 허용시장 40개"):
+        TradingEngine.validated_initial_markets(too_few_safe, safety)
+
+
+def test_refresh_markets_rejects_large_universe_shrink_without_replacing_old_set(
+    monkeypatch, tmp_path
+):
+    import junhyunbank.engine as base_module
+
+    initial = [
+        {"market": "KRW-BTC", "market_event": _normal_event()}
+    ] + [
+        {"market": f"KRW-X{index:03d}", "market_event": _normal_event()}
+        for index in range(99)
+    ]
+    client = _MarketClient(initial)
+    _FakeStream.instances.clear()
+    monkeypatch.setattr(base_module, "MarketStream", _FakeStream)
+    engine = _engine(tmp_path, client)
+    engine._refresh_markets()
+    original = list(engine._allowed_markets)
+
+    client.rows = initial[:20]
+    with pytest.raises(RuntimeError, match="허용시장 급감"):
+        engine._refresh_markets()
+
+    assert engine._allowed_markets == original
+    assert engine._market_discovery_ready is False
+
+
+def test_refresh_markets_rejects_same_size_universe_replacement(
+    monkeypatch, tmp_path
+):
+    """A same-sized but unrelated response is not healthy retention."""
+    import junhyunbank.engine as base_module
+
+    initial = [
+        {"market": "KRW-BTC", "market_event": _normal_event()}
+    ] + [
+        {"market": f"KRW-OLD{index:03d}", "market_event": _normal_event()}
+        for index in range(99)
+    ]
+    replacement = [
+        {"market": "KRW-BTC", "market_event": _normal_event()}
+    ] + [
+        {"market": f"KRW-NEW{index:03d}", "market_event": _normal_event()}
+        for index in range(99)
+    ]
+    client = _MarketClient(initial)
+    _FakeStream.instances.clear()
+    monkeypatch.setattr(base_module, "MarketStream", _FakeStream)
+    engine = _engine(tmp_path, client)
+    engine._refresh_markets()
+    original = list(engine._allowed_markets)
+
+    client.rows = replacement
+    with pytest.raises(RuntimeError, match="허용시장 급감"):
+        engine._refresh_markets()
+
+    assert engine._allowed_markets == original
+    assert engine._market_discovery_ready is False
 
 
 def test_deep_candidate_change_reuses_existing_stream(monkeypatch, tmp_path):

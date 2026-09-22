@@ -12,6 +12,7 @@ V4.0.3은 후보 평가 시점의 실제 top-of-book과 미래 top-of-book을 �
 
 - 현재 BUY 신호의 forward net return
 - 전체 후보 대비 BUY 신호의 차별성
+- Hot 후보와 결과를 보지 않고 순환 선택한 비후보 대조군의 차이
 - ExpectedMove와 실제 미래 절대 움직임의 calibration
 - 시간순 train/holdout 구간의 차이
 - label 누락률과 WebSocket 품질
@@ -20,8 +21,8 @@ V4.0.3은 후보 평가 시점의 실제 top-of-book과 미래 top-of-book을 �
 
 1. `/v1/market/all`에서 현재 KRW 시장을 읽고 기존 경보 해석 규칙으로 위험/미확인 시장을 제외한다.
 2. 전체 안전 KRW 시장의 public `trade` WebSocket을 수신해 실제 `MicroFlowStrategy`를 워밍업한다.
-3. 현재 Hot 후보와 이미 만들어진 미완료 label 종목에 대해 public `orderbook`을 구독한다.
-4. 후보 평가 시점에 특징값, regime, 진입판단, bid/ask를 기록한다.
+3. LIVE와 같은 fresh actionable 선택기로 고른 후보, 미래 결과와 무관하게 순환 선택한 대조군, 이미 만들어진 미완료 label 종목에 대해 public `orderbook`을 구독한다.
+4. 후보·대조군 평가 시점에 `sample_role`, 특징값, regime, 진입판단, bid/ask를 기록한다.
 5. 지정한 horizon 이후의 **future bid/ask**로 label을 만든다.
 
 기본 horizon은 30/60/120/300초다.
@@ -56,7 +57,11 @@ label completion rate가 낮은 실행은 전략 판단보다 데이터 품질 �
 검증기가 실제 엔진보다 느슨해 false BUY를 만들지 않도록 다음을 맞춘다.
 
 - trade/orderbook 중 하나라도 3초 이상 stale이면 BUY로 기록하지 않음
+- LIVE와 동일하게 stale 상위 후보를 먼저 제거하고 top-N 밖 fresh 시장을 보충하며 deep residency/switch margin을 적용
 - deep 분석에서 빠졌다 다시 들어온 종목은 이전 orderbook history와 cached quote를 폐기
+- 구독 종목 합집합이 그대로여도 control↔candidate 역할이 바뀌면 이전 book, cached quote, sampling timer를 폐기해 대조군 관측으로 후보를 사전 워밍업하지 않음
+- trade/orderbook WebSocket 재연결 시 영향을 받은 연속 history를 초기화
+- 전략이 거부한 역순·중복 orderbook으로 label quote를 갱신하지 않음
 - 이미 생성된 미완료 label 종목을 새 후보보다 orderbook subscription에서 우선 보호
 - 현재 `TradingEngine._is_warning_market()` 규칙으로 시장 경보 해석
 
@@ -90,6 +95,8 @@ label completion rate가 낮은 실행은 전략 판단보다 데이터 품질 �
 - 후보/샘플/BUY 수
 - label completion/miss 수
 - horizon별 all / buy / purged train buy / holdout buy 통계
+- horizon별 candidate / control 및 각각의 holdout 통계
+- candidate BUY/reason headline과 분리된 control BUY/reason 통계
 - mean/median net return, positive net rate
 - ExpectedMove 평균, 실제 절대움직임 coverage, correlation, observed/expected ratio
 - 개별 feature snapshot, entry bid/ask, future label
@@ -102,11 +109,15 @@ python scripts/validate_public_edge.py \
   --seconds 1800 \
   --horizons 30,60,120,300 \
   --sample-every 10 \
+  --control-count 4 \
+  --control-rotate-seconds 60 \
   --assumed-fee 0.0005 \
   --output edge-validation.json
 ```
 
 기본 15분도 실행은 가능하지만 전략 워밍업 3분과 최대 300초 label을 고려하면 실제 sampling 구간은 더 짧다. 한 세션으로 결론을 내리지 말고 서로 다른 시간대·평일/주말·상승/하락/급변 구간을 여러 번 수집해야 한다.
+
+정상 종료 실패, WebSocket 오류, 전략 입력검증에서 거부된 trade/orderbook, 해석 불가능한 quote, 표본 0건, `missed`/`pending`/`invalid` label, book 구독 상한 때문에 버린 신규 표본 중 하나라도 있으면 출력의 `data_integrity_ok`는 false이며 명령은 종료코드 2를 반환한다. `run.integrity_reasons`와 `run.integrity_counts`에 원인과 개수를 남기므로 파일은 조사에 사용할 수 있지만 정상 검증 세션으로 자동 승인하면 안 된다. 후보와 control 표본은 headline 통계부터 분리되며, 역할 전환 때 상태를 초기화하므로 대조군이 후보 결과를 미리 채우는 경로도 차단한다.
 
 ## 해석 원칙
 

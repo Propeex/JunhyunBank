@@ -6,6 +6,99 @@ from collections import defaultdict
 from typing import Any, Iterable
 
 
+def rotating_control_markets(
+    markets: Iterable[str],
+    *,
+    excluded: Iterable[str] = (),
+    count: int,
+    cursor: int = 0,
+) -> tuple[list[str], int]:
+    """Select an outcome-independent rotating control group.
+
+    Controls are drawn from the sorted non-candidate universe, so selection is
+    reproducible and never looks at future returns. Advancing the returned
+    cursor over time avoids permanently using only alphabetically early assets.
+    """
+    blocked = {str(market) for market in excluded if str(market)}
+    pool = sorted(
+        {
+            str(market)
+            for market in markets
+            if str(market) and str(market) not in blocked
+        }
+    )
+    size = max(0, min(int(count), len(pool)))
+    if size == 0:
+        return [], 0
+    start = max(0, int(cursor)) % len(pool)
+    selected = [pool[(start + offset) % len(pool)] for offset in range(size)]
+    return selected, (start + size) % len(pool)
+
+
+def sampling_role_entries(
+    *,
+    previous_candidates: Iterable[str] = (),
+    previous_controls: Iterable[str] = (),
+    next_candidates: Iterable[str] = (),
+    next_controls: Iterable[str] = (),
+) -> list[str]:
+    """Return markets entering a new active research sampling role.
+
+    A validator may keep a market subscribed after it leaves the production
+    candidate set because an existing forward label is still pending.  The
+    WebSocket union therefore can remain unchanged when that market later
+    becomes a candidate (or a control) again.  Comparing subscriptions alone
+    would then reuse pre-role order-book history that production would reset on
+    a new deep-candidate entry.
+    """
+    previous_role = {
+        str(market): "candidate"
+        for market in previous_candidates
+        if str(market)
+    }
+    previous_role.update(
+        {
+            str(market): "control"
+            for market in previous_controls
+            if str(market)
+        }
+    )
+    next_role = {
+        str(market): "candidate" for market in next_candidates if str(market)
+    }
+    next_role.update(
+        {
+            str(market): "control"
+            for market in next_controls
+            if str(market)
+        }
+    )
+    return sorted(
+        market
+        for market, role in next_role.items()
+        if previous_role.get(market) != role
+    )
+
+
+def count_role_buy_samples(
+    samples: Iterable[dict[str, Any]], *, role: str
+) -> int:
+    """Count BUY observations for exactly one declared sampling role.
+
+    Research controls run the same strategy evaluator as production
+    candidates.  Requiring an explicit role here prevents a control (or a
+    malformed role-less row) from leaking into the headline BUY count.
+    """
+    expected_role = str(role).strip().lower()
+    if expected_role not in {"candidate", "control"}:
+        raise ValueError("role must be 'candidate' or 'control'")
+    return sum(
+        str(sample.get("signal") or "").upper() == "BUY"
+        and str(sample.get("sample_role") or "").lower() == expected_role
+        for sample in samples
+    )
+
+
 def net_round_trip_return(
     entry_ask: float,
     future_bid: float,
@@ -227,6 +320,99 @@ def _label_status(sample: dict[str, Any], horizon: int) -> str:
     return "invalid"
 
 
+def validation_integrity_report(
+    samples: Iterable[dict[str, Any]],
+    horizons: Iterable[int],
+    *,
+    completed_cleanly: bool,
+    websocket_errors: dict[str, int] | None = None,
+    rejected_trade_events: int = 0,
+    rejected_orderbook_events: int = 0,
+    invalid_orderbook_quotes: int = 0,
+    dropped_new_samples_due_book_cap: int = 0,
+    controls_required: bool = False,
+) -> dict[str, Any]:
+    """Build a fail-closed quality gate for a live forward validation run.
+
+    The descriptive report is still useful when this gate fails, but automation
+    must not promote a partial/empty run or a run that silently rejected public
+    data as a completed validation dataset.
+    """
+    rows = list(samples)
+    requested_horizons = sorted(
+        {int(value) for value in horizons if int(value) > 0}
+    )
+
+    def count(value: Any) -> int:
+        number = _finite_float(value)
+        return max(0, int(number)) if number is not None else 0
+
+    websocket_error_count = sum(
+        count(value) for value in (websocket_errors or {}).values()
+    )
+    status_counts: dict[str, int] = defaultdict(int)
+    for sample in rows:
+        for horizon in requested_horizons:
+            status_counts[_label_status(sample, horizon)] += 1
+
+    incomplete_labels = sum(
+        status_counts.get(status, 0)
+        for status in ("missed", "pending", "invalid")
+    )
+    counters = {
+        "samples": len(rows),
+        "candidate_samples": sum(
+            str(sample.get("sample_role") or "").lower() == "candidate"
+            for sample in rows
+        ),
+        "control_samples": sum(
+            str(sample.get("sample_role") or "").lower() == "control"
+            for sample in rows
+        ),
+        "requested_labels": len(rows) * len(requested_horizons),
+        "labeled": status_counts.get("labeled", 0),
+        "missed_labels": status_counts.get("missed", 0),
+        "pending_labels": status_counts.get("pending", 0),
+        "invalid_labels": status_counts.get("invalid", 0),
+        "incomplete_labels": incomplete_labels,
+        "websocket_errors": websocket_error_count,
+        "rejected_trade_events": count(rejected_trade_events),
+        "rejected_orderbook_events": count(rejected_orderbook_events),
+        "invalid_orderbook_quotes": count(invalid_orderbook_quotes),
+        "dropped_new_samples_due_book_cap": count(
+            dropped_new_samples_due_book_cap
+        ),
+    }
+    reasons: list[str] = []
+    if not completed_cleanly:
+        reasons.append("run_incomplete")
+    if counters["websocket_errors"]:
+        reasons.append("websocket_errors")
+    if counters["rejected_trade_events"]:
+        reasons.append("rejected_trade_events")
+    if counters["rejected_orderbook_events"]:
+        reasons.append("rejected_orderbook_events")
+    if counters["invalid_orderbook_quotes"]:
+        reasons.append("invalid_orderbook_quotes")
+    if not counters["candidate_samples"]:
+        reasons.append("zero_candidate_samples")
+    if controls_required and not counters["control_samples"]:
+        reasons.append("zero_control_samples")
+    if counters["missed_labels"]:
+        reasons.append("missed_labels")
+    if counters["pending_labels"]:
+        reasons.append("pending_labels")
+    if counters["invalid_labels"]:
+        reasons.append("invalid_labels")
+    if counters["dropped_new_samples_due_book_cap"]:
+        reasons.append("book_capacity_drops")
+    return {
+        "data_integrity_ok": not reasons,
+        "reasons": reasons,
+        "counts": counters,
+    }
+
+
 def summarize_samples(
     samples: Iterable[dict[str, Any]],
     horizons: Iterable[int],
@@ -235,23 +421,38 @@ def summarize_samples(
 ) -> dict[str, Any]:
     """Build descriptive forward-edge reports for the current strategy.
 
-    BUY and all-candidate observations are reported separately. For each
-    horizon, train/holdout statistics use a purge gap equal to that horizon so
-    forward labels from the training set cannot overlap the beginning of the
-    holdout period. No thresholds are fitted or optimized here.
+    ``all``, ``buy``, ``train_buy`` and ``holdout_buy`` are production
+    candidate headlines. ``all_roles`` and the explicitly named control keys
+    are diagnostics, so control outcomes cannot silently alter a production
+    headline. For each horizon, train/holdout statistics use a purge gap equal
+    to that horizon so forward labels from the training set cannot overlap the
+    beginning of the holdout period. No thresholds are fitted or optimized
+    here.
     """
     source = _ordered(list(samples))
     raw_train, raw_holdout = chronological_split(source, split_fraction)
 
     def labeled(
-        rows: list[dict[str, Any]], horizon: int, only_buy: bool
+        rows: list[dict[str, Any]],
+        horizon: int,
+        only_buy: bool,
+        role: str | None = None,
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         key = str(int(horizon))
         for sample in rows:
+            if only_buy and str(sample.get("signal") or "").upper() != "BUY":
+                continue
             if (
                 only_buy
-                and str(sample.get("signal") or "").upper() != "BUY"
+                and role is None
+                and str(sample.get("sample_role") or "").lower()
+                != "candidate"
+            ):
+                continue
+            if (
+                role is not None
+                and str(sample.get("sample_role") or "").lower() != role
             ):
                 continue
             labels = sample.get("labels") or {}
@@ -265,8 +466,18 @@ def summarize_samples(
 
     report: dict[str, Any] = {
         "sample_count": len(source),
-        "buy_sample_count": sum(
-            str(sample.get("signal") or "").upper() == "BUY"
+        "buy_sample_count": count_role_buy_samples(
+            source, role="candidate"
+        ),
+        "control_buy_sample_count": count_role_buy_samples(
+            source, role="control"
+        ),
+        "candidate_sample_count": sum(
+            str(sample.get("sample_role") or "").lower() == "candidate"
+            for sample in source
+        ),
+        "control_sample_count": sum(
+            str(sample.get("sample_role") or "").lower() == "control"
             for sample in source
         ),
         "chronological_split_fraction": split_fraction,
@@ -287,6 +498,7 @@ def summarize_samples(
             sample
             for sample in source
             if str(sample.get("signal") or "").upper() == "BUY"
+            and str(sample.get("sample_role") or "").lower() == "candidate"
         ]
         buy_statuses = [
             _label_status(sample, horizon) for sample in buy_source
@@ -311,13 +523,48 @@ def summarize_samples(
             "purged_train_sample_count": len(train),
             "purged_from_train_count": max(0, len(raw_train) - len(train)),
             "holdout_sample_count": len(holdout),
-            "all": summarize_labeled_rows(labeled(source, horizon, False)),
+            "all": summarize_labeled_rows(
+                labeled(source, horizon, False, "candidate")
+            ),
+            "all_roles": summarize_labeled_rows(
+                labeled(source, horizon, False)
+            ),
             "buy": summarize_labeled_rows(labeled(source, horizon, True)),
             "train_buy": summarize_labeled_rows(
                 labeled(train, horizon, True)
             ),
             "holdout_buy": summarize_labeled_rows(
                 labeled(holdout, horizon, True)
+            ),
+            "candidate": summarize_labeled_rows(
+                labeled(source, horizon, False, "candidate")
+            ),
+            "control": summarize_labeled_rows(
+                labeled(source, horizon, False, "control")
+            ),
+            "candidate_buy": summarize_labeled_rows(
+                labeled(source, horizon, True, "candidate")
+            ),
+            "control_buy": summarize_labeled_rows(
+                labeled(source, horizon, True, "control")
+            ),
+            "train_candidate_buy": summarize_labeled_rows(
+                labeled(train, horizon, True, "candidate")
+            ),
+            "train_control_buy": summarize_labeled_rows(
+                labeled(train, horizon, True, "control")
+            ),
+            "holdout_candidate": summarize_labeled_rows(
+                labeled(holdout, horizon, False, "candidate")
+            ),
+            "holdout_control": summarize_labeled_rows(
+                labeled(holdout, horizon, False, "control")
+            ),
+            "holdout_candidate_buy": summarize_labeled_rows(
+                labeled(holdout, horizon, True, "candidate")
+            ),
+            "holdout_control_buy": summarize_labeled_rows(
+                labeled(holdout, horizon, True, "control")
             ),
         }
     return report

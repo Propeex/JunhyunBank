@@ -35,6 +35,8 @@ def build_query_string(values: dict[str, Any] | None) -> str:
 
 class UpbitClient:
     BASE_URL = "https://api.upbit.com"
+    _GET_MAX_ATTEMPTS = 3
+    _GET_RETRY_BASE_SECONDS = 0.2
 
     def __init__(
         self,
@@ -47,7 +49,7 @@ class UpbitClient:
         self.http = httpx.Client(
             base_url=self.BASE_URL,
             timeout=timeout,
-            headers={"Accept": "application/json", "User-Agent": "JunhyunBank/4.0"},
+            headers={"Accept": "application/json", "User-Agent": "JunhyunBank/4.3"},
         )
         self._private_lock = threading.Lock()
         self._last_private_request = 0.0
@@ -104,9 +106,11 @@ class UpbitClient:
     ) -> Any:
         auth_values = json_body if json_body is not None else params
         lock = self._private_lock if private else _NullLock()
+        is_get = method.upper() == "GET"
+        attempts = self._GET_MAX_ATTEMPTS if is_get else 1
 
         with lock:
-            for attempt in range(3 if method.upper() == 'GET' else 1):
+            for attempt in range(attempts):
                 headers: dict[str, str] = {}
                 if private:
                     self._private_rate_guard()
@@ -114,17 +118,26 @@ class UpbitClient:
                 if json_body is not None:
                     headers["Content-Type"] = "application/json"
 
-                response = self.http.request(
-                    method,
-                    path,
-                    params=params,
-                    json=json_body,
-                    headers=headers,
-                )
+                try:
+                    response = self.http.request(
+                        method,
+                        path,
+                        params=params,
+                        json=json_body,
+                        headers=headers,
+                    )
+                except httpx.TimeoutException:
+                    if not is_get or attempt + 1 >= attempts:
+                        raise
+                    time.sleep(self._GET_RETRY_BASE_SECONDS * (2**attempt))
+                    continue
                 if response.status_code == 429:
-                    if method.upper() != 'GET':
+                    if not is_get or attempt + 1 >= attempts:
                         self._raise_for_error(response)
-                    time.sleep(1.05 * (attempt + 1))
+                    time.sleep(1.05 * (2**attempt))
+                    continue
+                if 500 <= response.status_code < 600 and is_get and attempt + 1 < attempts:
+                    time.sleep(self._GET_RETRY_BASE_SECONDS * (2**attempt))
                     continue
                 if response.status_code == 418:
                     raise UpbitAPIError(
@@ -172,6 +185,18 @@ class UpbitClient:
         return self._request(
             "GET", "/v1/ticker", params={"markets": ",".join(markets)}
         )
+
+    def get_orderbooks(self, markets: list[str]) -> list[dict[str, Any]]:
+        if not markets:
+            return []
+        payload = self._request(
+            "GET", "/v1/orderbook", params={"markets": ",".join(markets)}
+        )
+        if not isinstance(payload, list) or any(
+            not isinstance(row, dict) for row in payload
+        ):
+            raise UpbitAPIError("업비트 호가 응답 형식이 배열이 아닙니다.")
+        return payload
 
     def get_minute_candles(
         self, market: str, unit: int = 5, count: int = 120
@@ -233,6 +258,7 @@ class UpbitClient:
             "price": f"{krw_amount:.0f}",
             "ord_type": "best",
             "time_in_force": "ioc",
+            "smp_type": "cancel_taker",
             "identifier": identifier or f"junhyunbank-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
@@ -244,6 +270,7 @@ class UpbitClient:
             "volume": format(volume, ".16g"),
             "ord_type": "best",
             "time_in_force": "ioc",
+            "smp_type": "cancel_taker",
             "identifier": identifier or f"junhyunbank-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)
@@ -264,6 +291,7 @@ class UpbitClient:
             "side": "ask",
             "volume": format(volume, ".16g"),
             "ord_type": "market",
+            "smp_type": "cancel_taker",
             "identifier": identifier or f"junhyunbank-{uuid.uuid4()}",
         }
         return self._request("POST", "/v1/orders", json_body=body, private=True)

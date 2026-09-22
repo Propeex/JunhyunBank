@@ -48,6 +48,8 @@ clock은 recorder의 `received_monotonic_ns`를 첫 record 기준 0초로 변환
 
 따라서 replay는 실제 시간만큼 `sleep()`하지 않고도 recorded freshness gate를 재현한다.
 
+V4.3은 `received_ns`와 `received_monotonic_ns`를 모두 요구한다. 둘 중 하나라도 없는 record는 입력 무결성 실패이며, 해당 전략 이벤트는 fallback 현재시각을 만들어 replay하지 않는다. `received_ns`는 exchange timestamp가 당시 수신시각보다 허용범위를 벗어나게 과거이거나 미래인지 검증하는 데 사용한다.
+
 ## Event reconstruction
 
 Recorder record의 top-level `market`과 `exchange_timestamp_ms`를 `MicroFlowStrategy`가 기대하는 Public WebSocket event 형태로 복원한다.
@@ -75,7 +77,7 @@ Replay는 file record 순서를 그대로 처리한다. orderbook event가 들�
 - `health=1.0`: 전략 자체의 entry hypothesis 측정용이며 실제 계정 Strategy Health를 재구성하는 것이 아니다.
 - market regime은 replay 시점 전체 recorded safe KRW universe에서 계산한다.
 - fee는 CLI 기본 각 방향 0.05%이며 `--bid-fee`, `--ask-fee`로 바꿀 수 있다.
-- recorder가 Hot 후보에 대해서만 L2를 저장하므로 replay 평가도 실제 저장된 orderbook 종목에 한정된다.
+- recorder가 Hot 후보와 순환 대조군에 대해서만 L2를 저장하므로 replay 평가도 실제 저장된 orderbook 종목에 한정된다. 현재 recording의 구독 metadata가 선언한 Hot/control 역할을 그대로 복원하며, 대조군을 production 후보로 추측하지 않는다.
 
 각 평가에는 다음을 저장한다.
 
@@ -93,13 +95,14 @@ Replay는 file record 순서를 그대로 처리한다. orderbook event가 들�
 
 ## Deterministic fingerprint
 
-모든 decision row를 canonical JSON으로 직렬화해 순서대로 SHA-256에 넣는다.
+production Hot 후보 decision row를 canonical JSON으로 직렬화해 순서대로 SHA-256에 넣는다. control row는 별도 decision stream과 fingerprint로 계산한다.
 
 ```text
 summary.decision_fingerprint_sha256
+control_diagnostics.decision_fingerprint_sha256
 ```
 
-동일 recorder session + 동일 JunhyunBank 전략 코드 + 동일 StrategyConfig + 동일 fee/evaluation cadence이면 fingerprint가 동일해야 한다. 회귀테스트는 같은 synthetic recording을 두 번 replay해 decision list와 fingerprint가 정확히 같은지 확인한다.
+동일 recorder session + 동일 JunhyunBank 전략 코드 + 동일 StrategyConfig + 동일 fee/evaluation cadence이면 각 fingerprint가 동일해야 한다. production 결과는 `decisions`와 `summary`, 대조군 결과는 `control_decisions`와 `control_diagnostics`에 분리한다. 대조군 BUY와 사유는 production headline BUY·reason count에 섞이지 않는다. 회귀테스트는 같은 synthetic recording을 두 번 replay해 decision list와 fingerprint가 정확히 같은지 확인한다.
 
 이 fingerprint는 **수익성 지표가 아니다.** 전략 로직 변경으로 해석 결과가 달라졌는지 추적하는 재현성 지표다.
 
@@ -113,9 +116,14 @@ summary.decision_fingerprint_sha256
 - first/last receive timestamp
 - seq regression 개수
 - clock retrograde 개수
+- 누락된 wall/monotonic receive clock과 재생 불가능 이벤트 개수
+- stale/future exchange timestamp 개수
+- production 전략 입력검증에서 거부된 trade/orderbook 개수
+- recorder drop/writer 오류/WebSocket 오류 개수
 - nonzero order metadata 개수
+- Hot/control 역할 metadata 위반 개수
 
-`session_end`가 없는 비정상 종료 recording도 조사 목적으로 replay할 수 있지만 CLI exit code는 2로 반환해 자동화가 이를 완전한 연구 데이터로 승격하지 못하게 한다.
+`session_end`가 없거나 위 필수 무결성 항목 중 하나라도 실패한 recording은 조사 목적으로 replay할 수 있지만 CLI exit code는 2로 반환해 자동화가 이를 완전한 연구 데이터로 승격하지 못하게 한다. 현재 recorder처럼 session 시작에서 controls를 선언한 recording은 모든 orderbook 구독 metadata에 완전하고 겹치지 않는 Hot/control partition이 있어야 한다. 구독 합집합이 같아도 역할이 바뀐 시장은 book history와 평가시계를 초기화해 control 관측이 나중의 production 후보를 사전 워밍업하지 않게 한다. controls를 선언하지 않았던 과거 legacy recording에만 기존 `markets` 전체를 Hot으로 취급하는 호환 해석을 허용한다.
 
 ## 실행 예
 

@@ -1,8 +1,9 @@
-import queue
 import time
 
 from junhyunbank.config import AppConfig
+from junhyunbank.engine import EventBuffer
 from junhyunbank.live_engine import TradingEngine
+from junhyunbank.strategy import MicroFlowStrategy
 
 
 class _Storage:
@@ -14,15 +15,22 @@ class _Storage:
 
 
 class _Strategy:
-    def __init__(self, ages, scores):
+    def __init__(self, ages, scores, config):
         self.ages = dict(ages)
         self.scores = dict(scores)
+        self.config = config
 
     def trade_age(self, market):
         return float(self.ages.get(market, float("inf")))
 
     def hot_score(self, market):
         return float(self.scores.get(market, 0.0))
+
+    # Exercise the production selector with deterministic ages/scores instead
+    # of duplicating its policy in this test fixture.
+    select_actionable_deep_markets = (
+        MicroFlowStrategy.select_actionable_deep_markets
+    )
 
 
 def _engine(*, ages, scores, managed=()):
@@ -34,7 +42,7 @@ def _engine(*, ages, scores, managed=()):
     engine.config.strategy.deep_min_residency_seconds = 30.0
     engine.config.strategy.deep_switch_margin = 4.0
     engine.storage = _Storage(managed)
-    engine.strategy = _Strategy(ages, scores)
+    engine.strategy = _Strategy(ages, scores, engine.config.strategy)
     engine._allowed_markets = sorted(scores)
     engine._deep_markets = []
     engine._deep_entered_at = {}
@@ -43,7 +51,8 @@ def _engine(*, ages, scores, managed=()):
     engine._candidate_supplemented = 0
     engine._run_started_at = time.monotonic()
     engine._last_no_candidate_warning = 0.0
-    engine.events = queue.Queue()
+    engine.events = EventBuffer()
+    engine._reported_event_drops = 0
     engine._latest_prices = {}
     return engine
 
@@ -100,6 +109,29 @@ def test_stale_managed_position_remains_in_deep_monitoring_for_exit_safety():
 
     assert "KRW-MANAGED" in selected
     assert "KRW-FRESH" in selected
+
+
+def test_expired_incumbent_is_replaced_only_after_switch_margin_is_cleared():
+    engine = _engine(
+        ages={"KRW-A": 0.1, "KRW-B": 0.1},
+        scores={"KRW-A": 70.0, "KRW-B": 72.0},
+    )
+    engine.config.strategy.deep_candidate_count = 1
+    engine._deep_markets = ["KRW-A"]
+    engine._deep_entered_at = {
+        "KRW-A": time.monotonic() - 31.0,
+    }
+
+    selected = engine._select_deep_markets(
+        [("KRW-B", 72.0), ("KRW-A", 70.0)]
+    )
+    assert selected == ["KRW-A"]
+
+    engine.strategy.scores["KRW-B"] = 75.0
+    selected = engine._select_deep_markets(
+        [("KRW-B", 75.0), ("KRW-A", 70.0)]
+    )
+    assert selected == ["KRW-B"]
 
 
 def test_candidate_ui_event_is_rewritten_to_actionable_fresh_ranking():

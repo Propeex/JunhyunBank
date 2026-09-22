@@ -1,4 +1,4 @@
-# V4.0.5 검증 상태와 개발 로드맵
+# V4.3.0 검증 상태와 개발 로드맵
 
 이 문서의 목적은 **무엇이 구현됐는가보다 무엇을 아직 믿으면 안 되는가**를 명확히 유지하는 것이다.
 
@@ -41,7 +41,7 @@
 - MDD/tail loss
 - parameter sensitivity
 
-V4.0.5 기준 A/B와 C의 주요 구조는 크게 보강됐고, D는 **측정 → 저장 → 동일 경로 재현**까지 왔다. 그러나 execution realism과 충분한 장기간 OOS가 아직 없으므로 “릴리즈가 성공했다”와 “수익성이 검증됐다”를 같은 뜻으로 사용하지 않는다.
+V4.3.0 기준 A/B와 C의 주요 구조는 입력 무결성, 위험예산, 영속 청산상태, managed balance 격리까지 보강됐고, D는 **측정 → 저장 → 동일 의사결정 경로 재현**까지 왔다. 그러나 execution realism과 충분한 장기간 OOS가 아직 없으므로 “릴리즈가 성공했다”와 “수익성이 검증됐다”를 같은 뜻으로 사용하지 않는다.
 
 ## 2. V4 실거래 안전성 기반
 
@@ -55,7 +55,7 @@ JunhyunBank가 직접 체결한 수량만 자동관리한다. 0/NULL managed qua
 
 ### 런타임 데이터
 
-Public WebSocket reconnect, 시장 discovery fail-closed/backoff, persistent deep orderbook subscription, deep 재진입 stale state 제거, 데이터 상태 UI, stale trade/orderbook 신규진입 차단을 유지한다.
+Public WebSocket reconnect, 시장 discovery fail-closed/backoff, persistent deep orderbook subscription, deep 재진입 stale state 제거, 데이터 상태 UI, stale trade/orderbook 신규진입 차단을 유지한다. V4.3부터 거래소 timestamp·sequence·숫자·호가구조를 검증한 이벤트만 가격/feature/freshness를 갱신하며 reconnect에서는 연속성에 의존한 history를 초기화한다. market 중복행은 warning/unknown 중 최악 상태로 합치고 `caution`/`warning`의 `null`·미확인 형식을 정상으로 추정하지 않는다. KRW-BTC가 안전 허용목록에 없거나 전체·안전 허용목록 중 하나라도 최소 크기 미달, 직전 정상 목록 대비 급감, 경보 schema 이상비율 초과이면 신규진입을 차단하며 기존 구독은 관리 포지션 청산용으로 유지한다.
 
 ### updater
 
@@ -65,6 +65,10 @@ V4.0.1부터 새 EXE digest, 기존 EXE+DB snapshot, `--post-update-verify`, DB 
 
 V4.0.2부터 authenticated `myOrder`/`myAsset`은 pending 상태 변화의 빠른 신호로만 사용한다. 실제 체결 회계는 identifier REST가 정본이며 Private WS 장애 시 REST fallback을 유지한다. `myAsset`으로 managed quantity를 추정하지 않는다.
 
+### V4.3 위험예산과 보유상태
+
+신규주문은 신호 비중뿐 아니라 현금 예비금, 단일/총 노출, 초기 손절거리 기반 거래/포트폴리오 위험, 최우선호가 표시 유동성 참여율, 세션 손실 조건을 함께 통과해야 한다. 시작 시 pending SELL을 먼저 조정하고 account/전략 PnL baseline을 만든다. 이 기준 구성이 실패해도 청산 엔진은 구동하되 해당 세션 신규매수는 영구 잠금한다. 세션 손실은 외부 입출금·비관리 자산을 제외한 누적 관리전략 실현손익과 열린 관리수량의 fresh bid 평가손익으로 계산한다. Best+IOC가 실제로 사용할 bid 1호가 depth가 전체 관리수량보다 작거나 다른 필수 값이 불명확하면 계산 불가로 처리해 신규매수를 막는다. Adaptive Trailing stop은 SQLite에 저장하고 낮추지 않으며 최대 보유시간을 둔다. 청산은 한 orderbook generation의 bid·spread·depth로 판단하고 POST 직전 generation을 다시 확인한다. 한 번의 account 잔고 누락으로 managed marker를 삭제하지 않고 반복 누락은 `QUARANTINED`, 최소주문 미만 잔량은 `DUST`로 보존한다. 핵심 회계 손상은 주문 전에 격리하고, 이미 실현된 KRW PnL 중 outcome 정규화 기준만 손상된 건은 별도 durable adjustment 원장에 보존한다. 정지와 주문 POST는 공통 gate에서 직렬화하고 BUY 직전 전체·종목별 데이터 신뢰성을 다시 확인한다.
+
 ## 3. 가장 중요한 전략 한계
 
 현재 `ExpectedMove`는 대략 다음 성격이다.
@@ -73,7 +77,7 @@ V4.0.2부터 authenticated `myOrder`/`myAsset`은 pending 상태 변화의 빠�
 ExpectedMove = recent |30s return| distribution의 70% quantile 계열
 ```
 
-이는 “현재 BUY 뒤 앞으로 얼마나 오를 것인가”가 아니라 최근의 **절대 움직임 크기 proxy**다. 현재 entry cost gate와 capital sizing에 사용되지만 방향성 성공확률/조건부 net expectancy가 충분히 검증되지 않았다. 이를 이미 검증된 edge라고 부르면 안 된다.
+이는 “현재 BUY 뒤 앞으로 얼마나 오를 것인가”가 아니라 최근의 **절대 움직임 크기 proxy**다. V4.3은 cost headroom과 signal 비중 상한에 제한적으로 사용하고, 손실위험 예산을 별도 최종 상한으로 둔다. 그래도 방향성 성공확률/조건부 net expectancy가 검증된 것은 아니며 이를 이미 검증된 edge라고 부르면 안 된다.
 
 ## 4. V4.0.3 — Forward Edge Validator
 
@@ -83,10 +87,13 @@ ExpectedMove = recent |30s return| distribution의 70% quantile 계열
 
 - 늦은 horizon quote를 임의로 사용하지 않고 `missed` 처리.
 - live와 동일한 stale gate.
+- live와 동일한 fresh 보충·deep residency·switch margin 후보 선택기.
 - deep 재진입 old book/quote 제거.
-- BUY와 전체 후보 분리.
+- control↔candidate 역할 전환도 old book/quote/sampling timer 제거.
+- BUY와 전체 후보 및 control 진단 분리.
 - ExpectedMove calibration 측정.
 - 시간순 holdout 경계에서 forward horizon overlap purge.
+- 전략 거부 event, invalid quote, 0 sample, 미완료 label, book-cap sample drop을 포함한 무결성 fail-closed와 종료코드 2.
 
 한계: size별 depth walk, 실제 주문 latency/partial fill, 실제 계정 fee/잔고/pending/Strategy Health를 재현하지 않는다.
 
@@ -95,14 +102,14 @@ ExpectedMove = recent |30s return| distribution의 70% quantile 계열
 `record_public_market.py`는 자격증명 없이 실제 Public market data를 저장한다.
 
 - 전체 안전 KRW raw trade.
-- 현재 Hot 후보 L2 orderbook, 기본 15 level.
+- LIVE 정합 fresh actionable 후보 L2 orderbook, 기본 15 level.
 - exchange timestamp.
 - local receive wall timestamp.
 - local receive monotonic timestamp.
 - process sequence.
-- session/config/subscription/error metadata.
+- session/config/subscription/error metadata와 구독별 Hot/control 역할 partition.
 
-WebSocket callback은 bounded queue에 `put_nowait`만 수행한다. disk I/O/fsync/rotation/gzip은 background worker로 분리한다. queue full은 callback을 block하지 않고 `dropped`로 드러내며 nonzero exit로 불완전 capture를 표시한다.
+WebSocket callback은 bounded queue에 `put_nowait`만 수행한다. disk I/O/fsync/rotation/gzip은 background worker로 분리한다. queue full은 callback을 block하지 않고 `dropped`로 드러내며, drop/writer/WebSocket 오류 중 하나라도 있으면 `data_integrity_ok=false`와 nonzero exit로 불완전 capture를 표시한다.
 
 활성 `.jsonl.part`는 crash 후 마지막 완전한 line까지 복구하고 atomic finalize한다. gzip도 `.gz.part`를 거쳐 durable finalize한 뒤 plain source를 삭제한다. bytes/file-count retention을 적용한다.
 
@@ -121,11 +128,12 @@ WebSocket callback은 bounded queue에 `put_nowait`만 수행한다. disk I/O/fs
 - session_start의 당시 `StrategyConfig`와 안전 KRW universe 복원.
 - recorder record를 원래 WebSocket event shape으로 재구성.
 - 저장된 orderbook 시점마다 종목별 cadence로 feature/entry decision/regime/top-of-book snapshot 생성.
-- 동일 recording + 동일 코드/config/fee의 decision rows를 canonical JSON으로 SHA-256 fingerprint.
+- Hot 후보와 control의 book history·평가시계·decision·fingerprint 분리. 역할 전환도 연속성 초기화.
+- 동일 recording + 동일 코드/config/fee의 각 decision stream을 canonical JSON으로 SHA-256 fingerprint.
 - incomplete session은 조사 가능하지만 CLI nonzero exit.
 - replay 경로는 API Key, UpbitClient, execution/order API를 사용하지 않음.
 
-`decision_fingerprint_sha256`는 **재현성 지표이지 수익성 지표가 아니다.**
+`decision_fingerprint_sha256`는 **재현성 지표이지 수익성 지표가 아니다.** V4.3은 sequence gap, session 경계, universe 밖 event, 두 local receive clock 누락, exchange timestamp 누락·수신시각 대비 stale/future, production 전략이 거부한 event, recorder drop/writer/WebSocket 오류와 Hot/control 역할 metadata 불일치를 별도 무결성 진단으로 다루며 필수 조건이 어긋난 세션을 정상 complete replay로 승인하지 않는다. controls가 선언된 recording은 모든 구독 update의 완전하고 겹치지 않는 역할 partition을 요구하며, controls가 없던 legacy recording만 전체 구독을 Hot으로 해석한다.
 
 ## 7. 연구 데이터 최소 품질 기준
 
@@ -134,9 +142,12 @@ WebSocket callback은 bounded queue에 `put_nowait`만 수행한다. disk I/O/fs
 - capture/replay의 `orders_submitted == 0`.
 - recorder drop == 0.
 - session start/end가 정상적으로 존재.
-- WebSocket 오류/gap이 과도하지 않음.
+- WebSocket 오류가 0이고 seq gap/regression이 없음.
+- 모든 record에 wall/monotonic receive clock이 있고 전략 이벤트의 exchange timestamp가 당시 수신시각 허용범위 안임.
 - 필요한 horizon의 label completion이 충분함.
+- validator의 `data_integrity_ok == true`: 거부 이벤트·invalid quote·0 sample·미완료 label·book-cap sample drop이 모두 0.
 - L2가 실제 평가 대상 후보에 존재함.
+- Hot/control 역할 metadata가 완전하고 서로 겹치지 않으며 headline 후보 통계와 control 진단이 분리됨.
 - seq/clock retrograde diagnostics가 비정상적으로 많지 않음.
 - BUY 표본 수가 통계 해석에 충분함.
 - 특정 한 코인/짧은 시간대에 표본과 성과가 몰리지 않음.
@@ -149,12 +160,12 @@ WebSocket callback은 bounded queue에 `put_nowait`만 수행한다. disk I/O/fs
 
 최소 요구:
 
-1. 당시 L2 snapshot에서 요청 KRW/수량별 depth walk.
-2. 매수는 ask side, 매도는 bid side로 실행 가능 가격 계산.
+1. 주문결정 뒤 configurable latency가 지난 최초 유효 orderbook을 접수시점 book으로 선택.
+2. live `best`+IOC와 동일하게 접수시점 상대 최우선호가 한 가격단계에서만 full/partial/no-fill 계산.
 3. fee + spread + depth impact 분리 기록.
 4. configurable latency: 0 / +100 / +250 / +500ms 등.
 5. 지연 후 최초 사용 가능한 book을 사용하되 데이터 gap/stale이면 fill 금지.
-6. IOC를 full/partial/no fill로 구분.
+6. 요청량이 최우선호가 capacity를 넘으면 초과분은 worse level에 체결시키지 않고 IOC remainder cancel로 처리.
 7. book capacity가 부족한 부분을 억지로 마지막 가격에 체결시키지 않음.
 8. simulator는 pure research layer이며 `execution.py`/실주문 API를 호출하지 않음.
 9. 같은 replay input + simulator config에서 동일 결과 fingerprint.
@@ -204,7 +215,7 @@ ExpectedMove 후보는 현재 features를 조건으로 한 **forward executable 
 
 새 estimator가 current volatility proxy보다 여러 OOS fold에서 일관되게 개선될 때만 live candidate가 된다.
 
-그 이후 sizing은 임의 고정 KRW cap 대신 다음 같은 데이터 기반 risk budget을 검토할 수 있다.
+V4.3은 먼저 손절거리·노출·현금·표시 유동성 기반 safety budget을 도입했다. 조건부 edge가 검증된 이후 sizing 연구는 이 안전상한을 대체하지 않고 그 안에서 다음 후보를 비교한다.
 
 - bootstrap lower-confidence edge.
 - damped Kelly류.
@@ -236,15 +247,15 @@ ExpectedMove 후보는 현재 features를 조건으로 한 **forward executable 
 
 기각해야 할 패턴은 training에서만 좋거나, threshold를 조금만 바꾸면 붕괴하거나, fee/spread를 빼야만 플러스이거나, 몇 번의 급등이 전체 성과 대부분이거나, realistic delay/depth를 넣으면 edge가 사라지거나, 누락된 label/fill을 무시했을 때만 좋아 보이는 경우다.
 
-## 15. 다음 릴리즈 순서
+## 15. 다음 연구 순서
 
 현재 권장 순서:
 
-1. **V4.0.5 deterministic replay 안정화/회귀검증.**
-2. **Execution simulator + fill diagnostics.**
-3. **Purged walk-forward/stress harness.**
-4. 여러 시장상태 recorder 데이터 축적 및 baseline report.
-5. Conditional ExpectedMove 후보 비교.
-6. 충분한 OOS 근거가 생긴 경우에만 live threshold/sizing 후보 검토.
+1. **장기간 recorder 데이터 품질 감사.** sequence/drop/session completeness와 후보 L2 coverage 확인.
+2. **Best+IOC execution simulator + fill diagnostics.** 접수 지연 뒤 최우선호가 full/partial/no-fill과 remainder cancel 재현.
+3. **Purged walk-forward/stress harness.** fee, latency, 유동성 축소, gap을 포함.
+4. 여러 시장상태 baseline report와 market/date/regime별 분해.
+5. Conditional ExpectedMove 후보를 현재 절대 변동폭 proxy와 같은 OOS에서 비교.
+6. 충분한 OOS 근거가 생긴 경우에만 V4.3 safety budget 안에서 live threshold/sizing 후보 검토.
 
 중요: 5~6을 데이터보다 먼저 구현해 live에 연결하지 않는다.

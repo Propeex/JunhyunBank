@@ -9,7 +9,10 @@ from junhyunbank.recorder import (
     MarketDataRecorder,
     RecorderConfig,
     iter_records,
+    recording_integrity_ok,
+    recording_integrity_reasons,
     recording_files,
+    subscription_metadata_changed,
 )
 
 
@@ -28,6 +31,25 @@ def _config(tmp_path: Path, **overrides) -> RecorderConfig:
     )
     values.update(overrides)
     return RecorderConfig(**values)
+
+
+def test_subscription_metadata_records_role_only_transition():
+    assert subscription_metadata_changed(
+        current_markets=["KRW-A", "KRW-B"],
+        current_hot={"KRW-A"},
+        current_controls={"KRW-B"},
+        next_markets=["KRW-A", "KRW-B"],
+        next_hot={"KRW-B"},
+        next_controls={"KRW-A"},
+    )
+    assert not subscription_metadata_changed(
+        current_markets=["KRW-A", "KRW-B"],
+        current_hot={"KRW-A"},
+        current_controls={"KRW-B"},
+        next_markets=["KRW-A", "KRW-B"],
+        next_hot={"KRW-A"},
+        next_controls={"KRW-B"},
+    )
 
 
 def test_recording_rotates_compresses_and_preserves_sequence(tmp_path):
@@ -143,9 +165,12 @@ def test_trade_and_orderbook_normalization_is_replayable(tmp_path):
             "bid_size": 2.5,
         }
     ]
+    stats = recorder.stats()
+    assert stats.trade_events == 1
+    assert stats.orderbook_events == 1
 
 
-def test_retention_keeps_only_newest_configured_file_count(tmp_path):
+def test_retention_never_truncates_the_active_session(tmp_path):
     recorder = MarketDataRecorder(
         _config(
             tmp_path,
@@ -160,7 +185,11 @@ def test_retention_keeps_only_newest_configured_file_count(tmp_path):
     assert recorder.stop(timeout=10)
 
     files = recording_files(tmp_path, "test")
-    assert 1 <= len(files) <= 2
+    # A segment-level max-files deletion used to remove segment 1 (and its
+    # session_start) while leaving an unreplayable tail. The active capture is
+    # kept as a complete unit; old sessions are retired as whole units.
+    assert len(files) > 2
+    assert [row["seq"] for row in iter_records(files)] == list(range(1, 31))
     assert not list(tmp_path.glob("*.part"))
 
 
@@ -175,3 +204,91 @@ def test_iter_records_reads_plain_and_gzip_segments(tmp_path):
     )
 
     assert [row["seq"] for row in iter_records(tmp_path, prefix="test")] == [1, 2]
+
+
+def test_duplicate_plain_and_gzip_artifact_is_read_once(tmp_path):
+    plain = tmp_path / "test-session-000001.jsonl"
+    row = {"schema_version": 1, "seq": 1, "kind": "meta", "data": {"n": 1}}
+    payload = json.dumps(row) + "\n"
+    plain.write_text(payload, encoding="utf-8")
+    compressed = tmp_path / "test-session-000001.jsonl.gz"
+    with gzip.open(compressed, "wt", encoding="utf-8") as handle:
+        handle.write(payload)
+
+    files = recording_files(tmp_path, "test")
+
+    assert files == [compressed]
+    assert list(iter_records([plain, compressed])) == [row]
+
+
+def test_session_end_contains_recorder_quality_snapshot(tmp_path):
+    recorder = MarketDataRecorder(
+        _config(tmp_path, compress=False, rotate_bytes=10_000)
+    )
+    recorder.start()
+    assert recorder.record_meta("session_start")
+    assert recorder.record_session_end(websocket_errors={}, orders_submitted=0)
+    assert recorder.stop(timeout=10)
+
+    rows = list(iter_records(tmp_path, prefix="test"))
+    end = rows[-1]["data"]
+    assert end["event"] == "session_end"
+    assert end["recorder_stats"]["enqueued_before_session_end"] == 1
+    assert end["recorder_stats"]["dropped"] == 0
+
+
+def test_websocket_error_fails_recording_automation_gate():
+    assert recording_integrity_ok(
+        stopped_cleanly=True,
+        dropped=0,
+        last_error="",
+        websocket_errors={},
+        trade_events=1,
+    )
+    assert not recording_integrity_ok(
+        stopped_cleanly=True,
+        dropped=0,
+        last_error="",
+        websocket_errors={"timestamp stale": 1},
+        trade_events=1,
+    )
+
+
+def test_recording_gate_requires_trade_and_requested_orderbook_events():
+    empty_reasons = recording_integrity_reasons(
+        stopped_cleanly=True,
+        dropped=0,
+        last_error="",
+        websocket_errors={},
+        trade_events=0,
+        orderbook_events=0,
+        orderbook_requested=True,
+    )
+    assert empty_reasons == ["zero_trade_events", "zero_orderbook_events"]
+    assert not recording_integrity_ok(
+        stopped_cleanly=True,
+        dropped=0,
+        last_error="",
+        websocket_errors={},
+        trade_events=0,
+        orderbook_events=0,
+        orderbook_requested=False,
+    )
+    assert recording_integrity_ok(
+        stopped_cleanly=True,
+        dropped=0,
+        last_error="",
+        websocket_errors={},
+        trade_events=1,
+        orderbook_events=0,
+        orderbook_requested=False,
+    )
+    assert not recording_integrity_ok(
+        stopped_cleanly=True,
+        dropped=0,
+        last_error="",
+        websocket_errors={},
+        trade_events=1,
+        orderbook_events=0,
+        orderbook_requested=True,
+    )

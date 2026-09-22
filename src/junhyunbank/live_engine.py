@@ -54,102 +54,21 @@ class TradingEngine(RuntimeTradingEngine):
         entry freshness because exits must continue to be monitored.
         """
         now = time.monotonic()
-        stale_limit = max(0.1, float(self.config.safety.market_data_stale_seconds))
-        scanner_limit = max(1, int(self.config.strategy.scanner_candidate_count))
-        deep_limit = max(1, int(self.config.strategy.deep_candidate_count))
-        managed = set(self.storage.managed_markets())
-        supplied = {market for market, _ in ranked}
-
-        actionable: list[tuple[str, float]] = []
-        stale_skipped = 0
-        for market, score in ranked:
-            # Managed positions are exit-monitoring targets, not entry slots.
-            if market in managed:
-                continue
-            if self.strategy.trade_age(market) <= stale_limit:
-                actionable.append((market, score))
-            else:
-                stale_skipped += 1
-
-        supplemented = 0
-        if len(actionable) < scanner_limit:
-            extras: list[tuple[str, float]] = []
-            for market in self._allowed_markets:
-                if market in supplied or market in managed:
-                    continue
-                if self.strategy.trade_age(market) > stale_limit:
-                    continue
-                score = float(self.strategy.hot_score(market))
-                if score > 0.0:
-                    extras.append((market, score))
-            extras.sort(key=lambda item: item[1], reverse=True)
-            need = scanner_limit - len(actionable)
-            chosen = extras[:need]
-            actionable.extend(chosen)
-            supplemented = len(chosen)
-
-        actionable.sort(key=lambda item: item[1], reverse=True)
-        deduped: list[tuple[str, float]] = []
-        seen: set[str] = set()
-        for market, score in actionable:
-            if market in seen:
-                continue
-            seen.add(market)
-            deduped.append((market, score))
-            if len(deduped) >= scanner_limit:
-                break
-
+        selection = self.strategy.select_actionable_deep_markets(
+            self._allowed_markets,
+            ranked,
+            current_deep=self._deep_markets,
+            entered_at=self._deep_entered_at,
+            now=now,
+            stale_limit=self.config.safety.market_data_stale_seconds,
+            managed=set(self.storage.managed_markets()),
+        )
+        deduped = selection.actionable_ranked
+        stale_skipped = selection.stale_skipped
+        selected = selection.selected
         self._actionable_ranked = tuple(deduped)
         self._candidate_stale_skipped = stale_skipped
-        self._candidate_supplemented = supplemented
-
-        desired = [
-            market
-            for market, _ in deduped[:deep_limit]
-            if market in self._allowed_markets
-        ]
-        scores = dict(deduped)
-        selected: list[str] = sorted(managed)
-
-        # Preserve anti-churn residency only while an entry candidate is still
-        # fresh enough to be actionable. Stale non-managed candidates are
-        # deliberately not carried forward, even if their 30-second residency
-        # has not elapsed.
-        for market in self._deep_markets:
-            if market in managed or market not in self._allowed_markets:
-                continue
-            if self.strategy.trade_age(market) > stale_limit:
-                continue
-            age = now - self._deep_entered_at.get(market, now)
-            if market in desired or age < self.config.strategy.deep_min_residency_seconds:
-                selected.append(market)
-
-        def nonmanaged_count() -> int:
-            return sum(1 for market in selected if market not in managed)
-
-        for market in desired:
-            if market in selected:
-                continue
-            if nonmanaged_count() < deep_limit:
-                selected.append(market)
-                continue
-            replaceable = [
-                current
-                for current in selected
-                if current not in managed
-                and current not in desired
-                and now - self._deep_entered_at.get(current, now)
-                >= self.config.strategy.deep_min_residency_seconds
-            ]
-            if not replaceable:
-                continue
-            weakest = min(replaceable, key=lambda current: scores.get(current, 0.0))
-            if (
-                scores.get(market, 0.0)
-                >= scores.get(weakest, 0.0) + self.config.strategy.deep_switch_margin
-            ):
-                selected.remove(weakest)
-                selected.append(market)
+        self._candidate_supplemented = selection.supplemented
 
         if (
             not deduped

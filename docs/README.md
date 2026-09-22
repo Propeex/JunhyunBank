@@ -7,20 +7,23 @@
 ## 읽는 순서
 
 1. [`DEVELOPER_HANDOFF.md`](DEVELOPER_HANDOFF.md) — 제품 의도, 절대 지켜야 할 원칙, 현재 버전/상태, 다음 작업
-2. [`ARCHITECTURE.md`](ARCHITECTURE.md) — 모듈 구조, 엔진 상태, 데이터/주문/업데이트 흐름
-3. [`STRATEGY_JH_MICROFLOW.md`](STRATEGY_JH_MICROFLOW.md) — 전략 철학, 수식, 실제 구현 규칙, 설계상 미구현 기능
-4. [`VALIDATION_AND_ROADMAP.md`](VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 알려진 결함/리스크, 실전 검증 계획, 우선순위
-5. [`UPBIT_INTEGRATION.md`](UPBIT_INTEGRATION.md) — Upbit API 사용법, 주문/인증/Rate Limit/보안 전제
-6. [`V4_AUDIT.md`](V4_AUDIT.md) — V4 런타임·매수 경로·주문 복구 감사와 남은 과제
-7. [`V4_0_1_UPDATE_RECOVERY.md`](V4_0_1_UPDATE_RECOVERY.md) — 새 EXE 사전검증, DB snapshot, 실패 시 EXE+DB 원자 롤백
-8. [`V4_0_2_PRIVATE_RECONCILIATION.md`](V4_0_2_PRIVATE_RECONCILIATION.md) — authenticated myOrder/myAsset 보조 감시, event-driven REST reconciliation, 잔고 보호 불변조건
-9. [`V4_0_3_EDGE_VALIDATION.md`](V4_0_3_EDGE_VALIDATION.md) — 주문 없는 public forward-edge 수집, label 품질, purged chronological holdout
-10. [`V4_0_4_MARKET_RECORDER.md`](V4_0_4_MARKET_RECORDER.md) — 비차단 raw trade/L2 recorder, crash-safe rotation, compression/retention, replay 데이터 형식
-11. [`V4_0_5_DETERMINISTIC_REPLAY.md`](V4_0_5_DETERMINISTIC_REPLAY.md) — recorder session 선택, logical receive clock, 동일 입력 decision fingerprint
-12. [`V4_0_6_BEST_IOC_EXECUTION_MODEL.md`](V4_0_6_BEST_IOC_EXECUTION_MODEL.md) — Upbit 최유리 지정가+IOC 실제 의미와 live top-level liquidity model 정합화
-13. [`V4_0_7_FRESH_CANDIDATE_PIPELINE.md`](V4_0_7_FRESH_CANDIDATE_PIPELINE.md) — stale 고득점 후보가 deep slot을 독점해 실제 진입 가능한 fresh 후보를 굶기는 현상과 재발 방지
-14. [`V3_RUNTIME_HARDENING.md`](V3_RUNTIME_HARDENING.md) — V3 Public WebSocket 안정화와 런타임 진단
-15. [`V3_0_1_MARKET_DISCOVERY_FIX.md`](V3_0_1_MARKET_DISCOVERY_FIX.md) — `Trade WS 0/0` / KRW 유니버스 0개 증상, 원인 경로, V3.0.1 보완과 검증 기준
+2. [`V4_3_REAL_WORLD_HARDENING.md`](V4_3_REAL_WORLD_HARDENING.md) — V4.3 입력·위험예산·청산·managed state·검증 강화와 남은 한계
+3. [`ARCHITECTURE.md`](ARCHITECTURE.md) — 모듈 구조, 엔진 상태, 데이터/주문/업데이트 흐름
+4. [`STRATEGY_JH_MICROFLOW.md`](STRATEGY_JH_MICROFLOW.md) — 전략 철학, 수식, 실제 구현 규칙, 설계상 미구현 기능
+5. [`VALIDATION_AND_ROADMAP.md`](VALIDATION_AND_ROADMAP.md) — 현재 검증 수준, 알려진 결함/리스크, 실전 검증 계획, 우선순위
+6. [`UPBIT_INTEGRATION.md`](UPBIT_INTEGRATION.md) — Upbit API 사용법, 주문/인증/Rate Limit/보안 전제
+7. [`V4_2_ENTRY_AND_CHART.md`](V4_2_ENTRY_AND_CHART.md) — 지속 수급 진입과 시간축 차트
+8. [`V4_1_POSITION_POLICY.md`](V4_1_POSITION_POLICY.md) — 진입과 보유 판단 분리, 반전 확인 청산
+9. [`V4_AUDIT.md`](V4_AUDIT.md) — V4 런타임·매수 경로·주문 복구 감사와 남은 과제
+10. [`V4_0_1_UPDATE_RECOVERY.md`](V4_0_1_UPDATE_RECOVERY.md) — 새 EXE 사전검증, DB snapshot, 실패 시 EXE+DB 원자 롤백
+11. [`V4_0_2_PRIVATE_RECONCILIATION.md`](V4_0_2_PRIVATE_RECONCILIATION.md) — authenticated myOrder/myAsset 보조 감시, event-driven REST reconciliation, 잔고 보호 불변조건
+12. [`V4_0_3_EDGE_VALIDATION.md`](V4_0_3_EDGE_VALIDATION.md) — 주문 없는 public forward-edge 수집, label 품질, purged chronological holdout
+13. [`V4_0_4_MARKET_RECORDER.md`](V4_0_4_MARKET_RECORDER.md) — 비차단 raw trade/L2 recorder, crash-safe rotation, compression/retention, replay 데이터 형식
+14. [`V4_0_5_DETERMINISTIC_REPLAY.md`](V4_0_5_DETERMINISTIC_REPLAY.md) — recorder session 선택, logical receive clock, 동일 입력 decision fingerprint
+15. [`V4_0_6_BEST_IOC_EXECUTION_MODEL.md`](V4_0_6_BEST_IOC_EXECUTION_MODEL.md) — Upbit 최유리 지정가+IOC 실제 의미와 live top-level liquidity model 정합화
+16. [`V4_0_7_FRESH_CANDIDATE_PIPELINE.md`](V4_0_7_FRESH_CANDIDATE_PIPELINE.md) — stale 고득점 후보가 deep slot을 독점해 실제 진입 가능한 fresh 후보를 굶기는 현상과 재발 방지
+17. [`V3_RUNTIME_HARDENING.md`](V3_RUNTIME_HARDENING.md) — V3 Public WebSocket 안정화와 런타임 진단
+18. [`V3_0_1_MARKET_DISCOVERY_FIX.md`](V3_0_1_MARKET_DISCOVERY_FIX.md) — `Trade WS 0/0` / KRW 유니버스 0개 증상, 원인 경로, V3.0.1 보완과 검증 기준
 
 ## 문서 유지 규칙
 

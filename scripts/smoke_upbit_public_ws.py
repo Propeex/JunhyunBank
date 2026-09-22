@@ -4,6 +4,7 @@ import argparse
 import threading
 import time
 
+from junhyunbank.config import SafetyConfig
 from junhyunbank.market_stream import MarketStream
 from junhyunbank.runtime_engine import TradingEngine
 from junhyunbank.upbit import UpbitClient
@@ -24,40 +25,19 @@ def _discover_safe_krw_market() -> tuple[str | None, str]:
         client.close()
         return None, f"market discovery request failed: {exc}"
 
-    raw_krw = []
-    safe_krw = []
-    flagged = 0
-    unknown = 0
     try:
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            market = str(row.get("market") or "").strip().upper()
-            if not market.startswith("KRW-"):
-                continue
-            raw_krw.append(market)
-            is_flagged, understood = TradingEngine._market_alert_status(row)
-            if is_flagged:
-                flagged += 1
-            elif understood:
-                safe_krw.append(market)
-            else:
-                unknown += 1
+        snapshot = TradingEngine._classify_market_universe(rows)
+        safe_krw = TradingEngine.validated_initial_markets(rows, SafetyConfig())
+    except RuntimeError as exc:
+        return None, str(exc)
     finally:
         client.close()
 
-    if not raw_krw:
-        return None, f"market discovery returned no KRW pairs; rows={len(rows)}"
-    if not safe_krw:
-        return None, (
-            f"market discovery produced zero safe KRW pairs; raw={len(raw_krw)} "
-            f"flagged={flagged} unknown={unknown}"
-        )
-
     market = "KRW-BTC" if "KRW-BTC" in safe_krw else safe_krw[0]
     return market, (
-        f"market discovery ok; rows={len(rows)} raw_krw={len(raw_krw)} "
-        f"safe_krw={len(safe_krw)} flagged={flagged} unknown={unknown} "
+        f"market discovery ok; rows={len(rows)} raw_krw={len(snapshot['raw_krw'])} "
+        f"safe_krw={len(safe_krw)} flagged={snapshot['flagged_count']} "
+        f"unknown={snapshot['unknown_count']} "
         f"probe={market}"
     )
 

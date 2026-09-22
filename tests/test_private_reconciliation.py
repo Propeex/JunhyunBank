@@ -53,6 +53,10 @@ def create_buy_intent(e: TradingEngine, identifier: str) -> None:
             "expected_horizon_seconds": 60.0,
         },
     )
+    # These fixtures model intents that crossed the durable pre-POST boundary
+    # and therefore may exist at the exchange. A versioned PREPARED-only row is
+    # now correctly discarded without any REST lookup on restart.
+    e.storage.mark_order_submitted(identifier)
 
 
 def test_myorder_event_accelerates_canonical_rest_reconciliation(tmp_path):
@@ -103,6 +107,71 @@ def test_manual_order_event_never_wakes_or_mutates_junhyunbank_intent(tmp_path):
     assert e.client.calls == []
     assert len(e.storage.pending_orders()) == 1
     assert not e.storage.managed_markets()
+
+
+def test_external_sell_immediately_quarantines_managed_asset(tmp_path):
+    e = engine(tmp_path)
+    e.storage.mark_managed_position(
+        "KRW-X", managed_quantity=2, entry_price=10000
+    )
+
+    e._on_private_order(
+        {
+            "type": "myOrder",
+            "code": "KRW-X",
+            "identifier": "manual-sell-123",
+            "ask_bid": "ASK",
+            "state": "wait",
+            "executed_volume": 0,
+        }
+    )
+
+    state = e.storage.get_managed_state("KRW-X")
+    assert state["status"] == "QUARANTINED"
+    assert e._submission_allowed("KRW-X", "SELL") is False
+    assert any(
+        row.get("type") == "managed_quarantine" for row in e.drain_events()
+    )
+
+
+def test_cancelled_unfilled_external_sell_does_not_quarantine(tmp_path):
+    e = engine(tmp_path)
+    e.storage.mark_managed_position(
+        "KRW-X", managed_quantity=2, entry_price=10000
+    )
+
+    e._on_private_order(
+        {
+            "type": "myOrder",
+            "code": "KRW-X",
+            "identifier": "manual-cancel-123",
+            "ask_bid": "ASK",
+            "state": "cancel",
+            "executed_volume": 0,
+        }
+    )
+
+    assert e.storage.get_managed_state("KRW-X")["status"] == "ACTIVE"
+
+
+def test_partially_filled_external_ioc_sell_quarantines_on_cancel(tmp_path):
+    e = engine(tmp_path)
+    e.storage.mark_managed_position(
+        "KRW-X", managed_quantity=2, entry_price=10000
+    )
+
+    e._on_private_order(
+        {
+            "type": "myOrder",
+            "code": "KRW-X",
+            "identifier": "manual-ioc-123",
+            "ask_bid": "ASK",
+            "state": "cancel",
+            "executed_volume": 0.5,
+        }
+    )
+
+    assert e.storage.get_managed_state("KRW-X")["status"] == "QUARANTINED"
 
 
 def test_myasset_is_signal_only_and_never_replaces_managed_quantity(tmp_path):
