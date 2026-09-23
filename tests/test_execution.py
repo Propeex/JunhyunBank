@@ -84,6 +84,21 @@ def test_timeout_is_recovered_by_identifier_after_restart_without_repost(engine)
     assert engine.client.calls[-1] == ('lookup', {'identifier':pending[0]['identifier']})
 
 
+def test_restart_discards_provably_pre_post_intent_without_exchange_lookup(engine):
+    engine.storage.create_order_intent(
+        'prepared-only', 'KRW-X', 'BUY', {'reason': 'crash window'}
+    )
+
+    engine._reconcile_orders()
+
+    assert engine.storage.pending_orders() == []
+    assert [call for call in engine.client.calls if call[0] == 'lookup'] == []
+    assert any(
+        'POST 이전에 중단된 주문 의도' in event.get('reason', '')
+        for event in engine.drain_events()
+    )
+
+
 def test_explicit_rejection_does_not_leave_pending_order(engine):
     engine.client.error = UpbitAPIError('insufficient_funds',400)
     buy(engine)
@@ -125,6 +140,7 @@ def test_partial_sells_preserve_unrelated_balance_and_aggregate_outcome(engine):
     outcomes = engine.storage.strategy_outcomes()
     assert len(outcomes) == 1
     assert outcomes[0] == pytest.approx(.09895/.01)
+    assert engine.storage.strategy_realized_pnl_total() == pytest.approx(1979.0)
 
 
 @pytest.mark.parametrize('state',['wait','watch',None])
@@ -163,6 +179,37 @@ def test_stop_during_intent_write_prevents_submission(engine,monkeypatch):
     assert not engine.storage.pending_orders()
 
 
+def test_stop_during_submitted_marker_prevents_post(engine, monkeypatch):
+    original = engine.storage.mark_order_submitted
+
+    def stop(identifier):
+        original(identifier)
+        engine.emergency_stop()
+
+    monkeypatch.setattr(engine.storage, 'mark_order_submitted', stop)
+    buy(engine)
+
+    assert not engine.client.calls
+    assert not engine.storage.pending_orders()
+
+
+def test_disconnected_global_shard_at_final_preflight_prevents_post(engine, monkeypatch):
+    ready = True
+    monkeypatch.setattr(engine, '_global_market_data_ready', lambda: ready)
+    original = engine.storage.mark_order_submitted
+
+    def disconnect(identifier):
+        nonlocal ready
+        original(identifier)
+        ready = False
+
+    monkeypatch.setattr(engine.storage, 'mark_order_submitted', disconnect)
+    buy(engine)
+
+    assert not engine.client.calls
+    assert not engine.storage.pending_orders()
+
+
 def test_order_post_429_is_not_automatically_retried():
     client=UpbitClient('access','x'*64)
     calls=[]
@@ -192,3 +239,101 @@ def test_zero_managed_quantity_is_never_replaced_with_account_balance(engine):
     engine._evaluate_cycle()
     assert engine.storage.get_managed_state('KRW-X')['managed_quantity']==0
     assert not engine.client.calls
+
+
+def test_preexisting_below_minimum_position_becomes_nonblocking_dust(engine):
+    engine.storage.mark_managed_position(
+        'KRW-X',
+        managed_quantity=0.1,
+        entry_price=10000,
+    )
+
+    engine._sell_managed(
+        market='KRW-X',
+        position=Position('KRW-X', 0.1, 10000),
+        managed_qty=0.1,
+        current_price=10000,
+        min_ask_krw=5000,
+        ask_fee=.0005,
+        state={},
+        reason='exit',
+    )
+
+    assert engine.storage.get_managed_state('KRW-X')['status'] == 'DUST'
+    assert engine.storage.drain_blocking_markets() == set()
+    assert not engine.client.calls
+
+
+def test_temporarily_locked_quantity_is_not_mislabeled_as_dust(engine):
+    engine.storage.mark_managed_position(
+        'KRW-X',
+        managed_quantity=1.0,
+        entry_price=10000,
+    )
+
+    engine._sell_managed(
+        market='KRW-X',
+        position=Position('KRW-X', 0.1, 10000, locked=0.9),
+        managed_qty=1.0,
+        current_price=10000,
+        min_ask_krw=5000,
+        ask_fee=.0005,
+        state={},
+        reason='exit',
+    )
+
+    assert engine.storage.get_managed_state('KRW-X')['status'] == 'ACTIVE'
+    assert engine.storage.drain_blocking_markets() == {'KRW-X'}
+    assert not engine.client.calls
+    assert any(
+        '잠긴 관리수량' in event.get('reason', '')
+        for event in engine.drain_events()
+    )
+
+
+def test_sell_pre_submit_policy_veto_prevents_post(engine):
+    engine.storage.mark_managed_position(
+        'KRW-X',
+        managed_quantity=1.0,
+        entry_price=10000,
+    )
+
+    engine._sell_managed(
+        market='KRW-X',
+        position=Position('KRW-X', 1.0, 10000),
+        managed_qty=1.0,
+        current_price=9000,
+        min_ask_krw=5000,
+        ask_fee=.0005,
+        state={},
+        reason='Emergency Stop',
+        pre_submit_check=lambda: False,
+    )
+
+    assert engine.client.calls == []
+    assert engine.storage.pending_orders() == []
+    assert engine.storage.managed_markets() == {'KRW-X'}
+
+
+def test_smaller_account_quantity_is_quarantined_before_direct_sell(engine):
+    engine.storage.mark_managed_position(
+        'KRW-X',
+        managed_quantity=2.0,
+        entry_price=10000,
+    )
+
+    engine._sell_managed(
+        market='KRW-X',
+        position=Position('KRW-X', 1.0, 10000),
+        managed_qty=2.0,
+        current_price=9000,
+        min_ask_krw=5000,
+        ask_fee=.0005,
+        state={},
+        reason='Emergency Stop',
+    )
+
+    assert engine.client.calls == []
+    assert engine.storage.pending_orders() == []
+    assert engine.storage.get_managed_state('KRW-X')['status'] == 'QUARANTINED'
+    assert engine.storage.drain_blocking_markets() == set()

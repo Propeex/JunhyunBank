@@ -46,6 +46,7 @@ class StrategyDecision:
     capital_fraction: float = 0.0
     expected_horizon_seconds: float = 0.0
     hold_quality: float = 0.0
+    trailing_stop_price: float = 0.0
 
 
 @dataclass(slots=True)

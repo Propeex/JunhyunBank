@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Any
@@ -118,6 +119,28 @@ class TradingEngine(BaseTradingEngine):
                 }
             )
 
+    def _stream_status(self, payload: dict[str, Any]) -> None:
+        """Invalidate continuity whenever a public socket starts/restarts.
+
+        WebSocket reconnects do not replay every missed trade or book update.
+        Keeping the pre-gap baseline would make indicators look continuous when
+        they are not, so affected markets must warm up again.
+        """
+        state = str(payload.get("state") or "")
+        if state in {"connecting", "reconnecting"}:
+            name = str(payload.get("name") or "")
+            markets = [
+                str(market)
+                for market in (payload.get("market_codes") or [])
+                if str(market)
+            ]
+            if "orderbook" in name:
+                for market in markets:
+                    self.strategy.reset_orderbook(market)
+            elif "trade" in name:
+                self.strategy.reset_trades(markets)
+        super()._stream_status(payload)
+
     def _on_private_order(self, event: dict[str, Any]) -> None:
         self._private_order_events += 1
         identifier = str(event.get("identifier") or "").strip()
@@ -138,6 +161,39 @@ class TradingEngine(BaseTradingEngine):
                     "state": state,
                     "identifier": identifier,
                 }
+            )
+            return
+
+        # Upbit does not expose tax-lot ownership. Any external sell that can
+        # reserve or consume a managed asset makes it unsafe to assume the
+        # remaining same-asset balance still belongs to this program. Serialize
+        # quarantine against the final order POST boundary; an already in-flight
+        # program order completes its durable reconciliation, while a manual sell
+        # observed first prevents every later automatic sell.
+        ask_bid = str(event.get("ask_bid") or "").strip().upper()
+        try:
+            executed = float(event.get("executed_volume") or 0.0)
+        except (TypeError, ValueError):
+            executed = 0.0
+        external_sell_can_affect_balance = ask_bid == "ASK" and (
+            state in {"wait", "watch", "trade", "done"} or executed > 0.0
+        )
+        if (
+            external_sell_can_affect_balance
+            and market
+            and market in self.storage.managed_markets()
+        ):
+            with self._submission_gate:
+                self.storage.quarantine_managed_position(market)
+            self._emit(
+                "managed_quarantine",
+                (
+                    f"{market}: 외부 매도 주문 감지 · 관리 lot 소유권을 확인할 수 없어 "
+                    "즉시 격리하고 자동매도를 중단했습니다."
+                ),
+                market=market,
+                state=state,
+                identifier=identifier,
             )
 
     def _on_private_asset(self, event: dict[str, Any]) -> None:
@@ -183,6 +239,16 @@ class TradingEngine(BaseTradingEngine):
                 return
             identifier = str(intent.get("identifier") or "")
             if not identifier:
+                continue
+            if intent.get("submitted_at") is None and intent.get("intent_version") == 1:
+                if self.storage.reject_prepared_order_intent(
+                    identifier,
+                    "재시작 시 POST 이전 PREPARED 주문으로 확인되어 안전 폐기",
+                ):
+                    self._entry_status(
+                        intent["market"],
+                        "POST 이전에 중단된 주문 의도를 안전 폐기 · 거래소 주문 없음",
+                    )
                 continue
             if identifier not in forced and now < self._order_reconcile_retry_at.get(identifier, 0.0):
                 continue
@@ -235,7 +301,7 @@ class TradingEngine(BaseTradingEngine):
         if isinstance(value, bool):
             return value
         if value is None:
-            return False
+            return None
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return value != 0
         if isinstance(value, str):
@@ -268,22 +334,25 @@ class TradingEngine(BaseTradingEngine):
                 # market_event without warning is not the documented shape.
                 warning_known = False
 
-            caution_known = True
+            caution_known = "caution" in event
             caution_flagged = False
-            caution = event.get("caution")
-            if isinstance(caution, dict):
-                for value in caution.values():
-                    parsed = cls._coerce_alert_flag(value)
+            if caution_known:
+                caution = event.get("caution")
+                if isinstance(caution, dict):
+                    if not caution:
+                        caution_known = False
+                    for value in caution.values():
+                        parsed = cls._coerce_alert_flag(value)
+                        if parsed is None:
+                            caution_known = False
+                        elif parsed:
+                            caution_flagged = True
+                else:
+                    parsed = cls._coerce_alert_flag(caution)
                     if parsed is None:
                         caution_known = False
-                    elif parsed:
-                        caution_flagged = True
-            else:
-                parsed = cls._coerce_alert_flag(caution)
-                if parsed is None:
-                    caution_known = False
-                else:
-                    caution_flagged = parsed
+                    else:
+                        caution_flagged = parsed
 
             return warning or caution_flagged, warning_known and caution_known
 
@@ -304,6 +373,109 @@ class TradingEngine(BaseTradingEngine):
         flagged, understood = cls._market_alert_status(row)
         return flagged or not understood
 
+    @classmethod
+    def _classify_market_universe(
+        cls, rows: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Parse one Upbit market response without silently trusting its shape."""
+        # Aggregate by market using the most conservative status. Although the
+        # exchange normally returns one row per market, a duplicated/conflicting
+        # upstream response must never let a normal row override a warning or
+        # an unknown schema for the same symbol.
+        status_by_market: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            market = str(row.get("market") or "").strip().upper()
+            if not market.startswith("KRW-"):
+                continue
+            flagged, understood = cls._market_alert_status(row)
+            status = 2 if flagged else (1 if not understood else 0)
+            status_by_market[market] = max(
+                status_by_market.get(market, 0), status
+            )
+
+        raw_krw = sorted(status_by_market)
+        allowed = sorted(
+            market for market, status in status_by_market.items() if status == 0
+        )
+        flagged_count = sum(status == 2 for status in status_by_market.values())
+        unknown = sorted(
+            market for market, status in status_by_market.items() if status == 1
+        )
+        return {
+            "raw_krw": raw_krw,
+            "allowed": allowed,
+            "flagged_count": flagged_count,
+            "unknown_count": len(unknown),
+            "unknown_samples": unknown[:3],
+        }
+
+    @staticmethod
+    def _market_universe_anomalies(
+        snapshot: dict[str, Any],
+        safety: Any,
+        *,
+        previous_allowed: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> list[str]:
+        raw_krw = snapshot["raw_krw"]
+        allowed = snapshot["allowed"]
+        minimum_universe = max(1, int(safety.market_universe_min_size))
+        retained_fraction = min(
+            1.0,
+            max(0.0, float(safety.market_universe_min_retained_fraction)),
+        )
+        previous = set(previous_allowed or ())
+        retained = len(previous.intersection(allowed))
+        minimum_retained = math.ceil(len(previous) * retained_fraction) if previous else 0
+        unknown_fraction = (
+            float(snapshot["unknown_count"]) / len(raw_krw) if raw_krw else 1.0
+        )
+        reasons: list[str] = []
+        if "KRW-BTC" not in raw_krw:
+            reasons.append("대표시장 KRW-BTC 누락")
+        elif "KRW-BTC" not in allowed:
+            reasons.append("대표시장 KRW-BTC가 안전 허용목록에서 제외됨")
+        if len(raw_krw) < minimum_universe:
+            reasons.append(
+                f"KRW 시장 {len(raw_krw)}개 < 최소 {minimum_universe}개"
+            )
+        if len(allowed) < minimum_universe:
+            reasons.append(
+                f"안전 허용시장 {len(allowed)}개 < 최소 {minimum_universe}개"
+            )
+        if previous and retained < minimum_retained:
+            reasons.append(
+                f"허용시장 급감: 직전 목록 {len(previous)}개 중 {retained}개 유지 "
+                f"(유지기준 {minimum_retained}개)"
+            )
+        if unknown_fraction > max(
+            0.0, float(safety.market_unknown_alert_fraction)
+        ):
+            reasons.append(f"경보형식 미확인 비율 {unknown_fraction:.1%}")
+        return reasons
+
+    @classmethod
+    def validated_initial_markets(
+        cls, rows: list[dict[str, Any]], safety: Any
+    ) -> list[str]:
+        """Return a sane initial research/live universe or fail closed."""
+        snapshot = cls._classify_market_universe(rows)
+        raw_krw = snapshot["raw_krw"]
+        allowed = snapshot["allowed"]
+        if not raw_krw:
+            raise RuntimeError("업비트 페어 목록에서 KRW 마켓을 찾지 못했습니다.")
+        if not allowed:
+            raise RuntimeError(
+                "KRW 마켓은 수신했지만 안전하게 해석 가능한 종목이 0개입니다."
+            )
+        anomalies = cls._market_universe_anomalies(snapshot, safety)
+        if anomalies:
+            raise RuntimeError(
+                "시장 목록 응답 무결성 이상: " + "; ".join(anomalies)
+            )
+        return list(allowed)
+
     def _refresh_markets(self) -> None:
         # Base V2 calls market refresh on every loop while the universe is empty.
         # Back off failed discovery attempts here so an upstream/schema problem
@@ -320,32 +492,12 @@ class TradingEngine(BaseTradingEngine):
             self._market_discovery_retry_at = now + 10.0
             raise
 
-        raw_krw: list[str] = []
-        allowed: list[str] = []
-        flagged_count = 0
-        unknown_count = 0
-        unknown_samples: list[str] = []
-
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            market = str(row.get("market") or "").strip().upper()
-            if not market.startswith("KRW-"):
-                continue
-            raw_krw.append(market)
-            flagged, understood = self._market_alert_status(row)
-            if flagged:
-                flagged_count += 1
-                continue
-            if not understood:
-                unknown_count += 1
-                if len(unknown_samples) < 3:
-                    unknown_samples.append(market)
-                continue
-            allowed.append(market)
-
-        raw_krw = sorted(dict.fromkeys(raw_krw))
-        allowed = sorted(dict.fromkeys(allowed))
+        snapshot = self._classify_market_universe(rows)
+        raw_krw = snapshot["raw_krw"]
+        allowed = snapshot["allowed"]
+        flagged_count = snapshot["flagged_count"]
+        unknown_count = snapshot["unknown_count"]
+        unknown_samples = snapshot["unknown_samples"]
 
         if not raw_krw:
             self._market_discovery_ready = False
@@ -368,6 +520,21 @@ class TradingEngine(BaseTradingEngine):
                 f"KRW={len(raw_krw)}, 경보제외={flagged_count}, "
                 f"경보형식미확인={unknown_count}, 예시={unknown_samples}. "
                 "자동매매는 안전을 위해 시작하지 않습니다."
+            )
+
+        anomaly_reasons = self._market_universe_anomalies(
+            snapshot,
+            self.config.safety,
+            previous_allowed=self._allowed_markets,
+        )
+        if anomaly_reasons:
+            # Keep old subscriptions for managed exits, but close every new
+            # entry gate until a sane independent discovery response arrives.
+            self._market_discovery_ready = False
+            self._market_discovery_retry_at = now + 10.0
+            raise RuntimeError(
+                "시장 목록 응답 무결성 이상 · 신규매수 차단: "
+                + "; ".join(anomaly_reasons)
             )
 
         self._market_discovery_retry_at = 0.0
@@ -427,6 +594,7 @@ class TradingEngine(BaseTradingEngine):
                 on_status=self._stream_status,
                 orderbook_depth=max(5, self.config.strategy.orderbook_depth),
                 name="upbit-orderbook-deep",
+                max_event_lag_seconds=self.config.safety.market_data_stale_seconds,
             )
             self._deep_stream.start()
         else:

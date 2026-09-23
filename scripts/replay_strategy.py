@@ -61,6 +61,7 @@ def main() -> int:
     )
 
     summary = result["summary"]
+    control_diagnostics = result["control_diagnostics"]
     input_state = result["input"]
     print(
         json.dumps(
@@ -70,7 +71,16 @@ def main() -> int:
                 "evaluations": summary["evaluations"],
                 "buy_decisions": summary["buy_decisions"],
                 "fingerprint": summary["decision_fingerprint_sha256"],
+                "control_evaluations": control_diagnostics["evaluations"],
+                "control_buy_decisions": control_diagnostics["buy_decisions"],
                 "complete_session": input_state["complete_session"],
+                "data_integrity_ok": input_state["data_integrity_ok"],
+                "integrity_reasons": input_state["integrity_reasons"],
+                "market_events": input_state["market_events"],
+                "accepted_market_events": input_state[
+                    "accepted_market_events"
+                ],
+                "seq_gaps": input_state["seq_gaps"],
                 "clock_retrograde_events": input_state["clock_retrograde_events"],
                 "output": str(output),
                 "orders_submitted": 0,
@@ -82,7 +92,7 @@ def main() -> int:
 
     # An interrupted recorder session can still be inspected, but automation
     # must not silently treat it as a complete research dataset.
-    return 0 if input_state["complete_session"] and input_state["nonzero_orders_meta"] == 0 else 2
+    return 0 if input_state["data_integrity_ok"] else 2
 
 
 if __name__ == "__main__":

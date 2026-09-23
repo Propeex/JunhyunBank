@@ -57,105 +57,48 @@ class TradingEngine(RuntimeTradingEngine):
         """
         now = time.monotonic()
         stale_limit = max(0.1, float(self.config.safety.market_data_stale_seconds))
-        scanner_limit = max(1, int(self.config.strategy.scanner_candidate_count))
         deep_limit = max(1, int(self.config.strategy.deep_candidate_count))
         managed = set(self.storage.managed_markets())
-        supplied = {market for market, _ in ranked}
-
-        actionable: list[tuple[str, float]] = []
-        stale_skipped = 0
-        for market, score in ranked:
-            # Managed positions are exit-monitoring targets, not entry slots.
-            if market in managed:
-                continue
-            if self.strategy.trade_age(market) <= stale_limit:
-                actionable.append((market, score))
-            else:
-                stale_skipped += 1
-
-        supplemented = 0
-        if len(actionable) < scanner_limit:
-            extras: list[tuple[str, float]] = []
-            for market in self._allowed_markets:
-                if market in supplied or market in managed:
-                    continue
-                if self.strategy.trade_age(market) > stale_limit:
-                    continue
-                score = float(self.strategy.hot_score(market))
-                if score > 0.0:
-                    extras.append((market, score))
-            extras.sort(key=lambda item: item[1], reverse=True)
-            need = scanner_limit - len(actionable)
-            chosen = extras[:need]
-            actionable.extend(chosen)
-            supplemented = len(chosen)
-
-        actionable.sort(key=lambda item: item[1], reverse=True)
-        deduped: list[tuple[str, float]] = []
-        seen: set[str] = set()
-        for market, score in actionable:
-            if market in seen:
-                continue
-            seen.add(market)
-            deduped.append((market, score))
-            if len(deduped) >= scanner_limit:
-                break
-
+        selection = self.strategy.select_actionable_deep_markets(
+            self._allowed_markets,
+            ranked,
+            current_deep=self._deep_markets,
+            entered_at=self._deep_entered_at,
+            now=now,
+            stale_limit=stale_limit,
+            managed=managed,
+        )
+        deduped = selection.actionable_ranked
+        stale_skipped = selection.stale_skipped
+        selected = list(selection.selected)
         self._actionable_ranked = tuple(deduped)
         self._candidate_stale_skipped = stale_skipped
-        self._candidate_supplemented = supplemented
+        self._candidate_supplemented = selection.supplemented
 
-        desired = [
-            market
-            for market, _ in deduped[:deep_limit]
-            if market in self._allowed_markets
-        ]
-        scores = dict(deduped)
-        selected: list[str] = sorted(managed)
-
-        # Keep fresh incumbents until the replacement comparison below. Removing
-        # mature incumbents here would bypass the score-margin condition entirely.
-        incumbents: list[str] = []
-        for market in self._deep_markets:
-            if market in managed or market not in self._allowed_markets or market in incumbents:
-                continue
-            if self.strategy.trade_age(market) > stale_limit:
-                continue
-            if market not in scores:
-                # A truncated scanner list is not evidence of a zero score.
-                scores[market] = float(self.strategy.hot_score(market))
-            incumbents.append(market)
-        if len(incumbents) > deep_limit:
-            # A changed configuration can shrink the limit during a run.
-            incumbents.sort(key=lambda market: (market in desired, scores[market]), reverse=True)
-        selected.extend(incumbents[:deep_limit])
+        # A runtime configuration reduction must not leave more live scanner
+        # subscriptions than the new cap. Prefer incumbents that are still in
+        # the desired set, then their actual score, matching the legacy live
+        # selector without weakening normal residency/switch hysteresis.
+        nonmanaged = [market for market in selected if market not in managed]
+        if len(nonmanaged) > deep_limit:
+            desired = {
+                market
+                for market, _ in deduped[:deep_limit]
+                if market in self._allowed_markets
+            }
+            scores = dict(deduped)
+            for market in nonmanaged:
+                if market not in scores:
+                    scores[market] = float(self.strategy.hot_score(market))
+            nonmanaged.sort(
+                key=lambda market: (market in desired, scores.get(market, 0.0)),
+                reverse=True,
+            )
+            selected = [market for market in selected if market in managed]
+            selected.extend(nonmanaged[:deep_limit])
 
         def nonmanaged_count() -> int:
             return sum(1 for market in selected if market not in managed)
-
-        for market in desired:
-            if market in selected:
-                continue
-            if nonmanaged_count() < deep_limit:
-                selected.append(market)
-                continue
-            replaceable = [
-                current
-                for current in selected
-                if current not in managed
-                and current not in desired
-                and now - self._deep_entered_at.get(current, now)
-                >= self.config.strategy.deep_min_residency_seconds
-            ]
-            if not replaceable:
-                continue
-            weakest = min(replaceable, key=lambda current: scores.get(current, 0.0))
-            if (
-                scores.get(market, 0.0)
-                >= scores.get(weakest, 0.0) + self.config.strategy.deep_switch_margin
-            ):
-                selected.remove(weakest)
-                selected.append(market)
 
         # A brief trade lull must not discard ten seconds of valid book history
         # when there is no competing fresh candidate. Retention is bounded by

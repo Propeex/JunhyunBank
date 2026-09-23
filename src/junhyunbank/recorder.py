@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import threading
 import time
@@ -34,6 +35,8 @@ class RecorderStats:
     accepting: bool
     enqueued: int
     written: int
+    trade_events: int
+    orderbook_events: int
     dropped: int
     bytes_written: int
     queue_depth: int
@@ -44,6 +47,77 @@ class RecorderStats:
     writer_alive: bool
     compressor_alive: bool
     last_error: str
+
+
+def recording_integrity_ok(
+    *,
+    stopped_cleanly: bool,
+    dropped: int,
+    last_error: str,
+    websocket_errors: dict[str, int] | None = None,
+    trade_events: int = 0,
+    orderbook_events: int = 0,
+    orderbook_requested: bool = False,
+) -> bool:
+    """Return whether automation may promote this recording as complete."""
+    return not recording_integrity_reasons(
+        stopped_cleanly=stopped_cleanly,
+        dropped=dropped,
+        last_error=last_error,
+        websocket_errors=websocket_errors,
+        trade_events=trade_events,
+        orderbook_events=orderbook_events,
+        orderbook_requested=orderbook_requested,
+    )
+
+
+def recording_integrity_reasons(
+    *,
+    stopped_cleanly: bool,
+    dropped: int,
+    last_error: str,
+    websocket_errors: dict[str, int] | None = None,
+    trade_events: int = 0,
+    orderbook_events: int = 0,
+    orderbook_requested: bool = False,
+) -> list[str]:
+    """Return stable fail-closed reason codes for recorder promotion."""
+    reasons: list[str] = []
+    if not stopped_cleanly:
+        reasons.append("unclean_stop")
+    if int(dropped) != 0:
+        reasons.append("dropped_records")
+    if str(last_error or "").strip():
+        reasons.append("recorder_error")
+    if websocket_errors:
+        reasons.append("websocket_errors")
+    if int(trade_events) <= 0:
+        reasons.append("zero_trade_events")
+    if orderbook_requested and int(orderbook_events) <= 0:
+        reasons.append("zero_orderbook_events")
+    return reasons
+
+
+def subscription_metadata_changed(
+    *,
+    current_markets: Iterable[str],
+    current_hot: Iterable[str],
+    current_controls: Iterable[str],
+    next_markets: Iterable[str],
+    next_hot: Iterable[str],
+    next_controls: Iterable[str],
+) -> bool:
+    """Return whether replay-visible subscription metadata must be emitted.
+
+    The WebSocket market union can remain unchanged while a control market and
+    a production candidate exchange roles. That role-only transition is still
+    material to replay and must receive its own sequence-stamped metadata row.
+    """
+    return bool(
+        list(current_markets) != list(next_markets)
+        or set(current_hot) != set(next_hot)
+        or set(current_controls) != set(next_controls)
+    )
 
 
 class MarketDataRecorder:
@@ -81,6 +155,8 @@ class MarketDataRecorder:
         self._sequence = 0
         self._enqueued = 0
         self._written = 0
+        self._trade_events = 0
+        self._orderbook_events = 0
         self._dropped = 0
         self._bytes_written = 0
         self._segments_finalized = 0
@@ -146,6 +222,8 @@ class MarketDataRecorder:
                 accepting=self._accepting,
                 enqueued=self._enqueued,
                 written=self._written,
+                trade_events=self._trade_events,
+                orderbook_events=self._orderbook_events,
                 dropped=self._dropped,
                 bytes_written=self._bytes_written,
                 queue_depth=self._queue.qsize(),
@@ -178,30 +256,38 @@ class MarketDataRecorder:
         with self._lock:
             if not self._accepting:
                 return False
-        record = {
-            "schema_version": self.SCHEMA_VERSION,
-            "seq": self._next_sequence(),
-            "kind": str(kind),
-            "market": str(market or ""),
-            "received_ns": int(received_ns or time.time_ns()),
-            "received_monotonic_ns": int(
-                received_monotonic_ns or time.monotonic_ns()
-            ),
-            "exchange_timestamp_ms": (
-                int(exchange_timestamp_ms)
-                if exchange_timestamp_ms is not None
-                else None
-            ),
-            "data": data or {},
-        }
-        try:
-            self._queue.put_nowait(record)
-        except queue.Full:
-            with self._lock:
+            # Allocate the sequence and enqueue under the same lock. Multiple
+            # WebSocket callback threads otherwise can obtain seq N/N+1 and
+            # put them into the queue in the opposite order. A full queue still
+            # consumes a sequence on purpose, making the loss visible as a gap
+            # in the finalized recording.
+            self._sequence += 1
+            record = {
+                "schema_version": self.SCHEMA_VERSION,
+                "seq": self._sequence,
+                "kind": str(kind),
+                "market": str(market or ""),
+                "received_ns": int(received_ns or time.time_ns()),
+                "received_monotonic_ns": int(
+                    received_monotonic_ns or time.monotonic_ns()
+                ),
+                "exchange_timestamp_ms": (
+                    int(exchange_timestamp_ms)
+                    if exchange_timestamp_ms is not None
+                    else None
+                ),
+                "data": dict(data or {}),
+            }
+            try:
+                self._queue.put_nowait(record)
+            except queue.Full:
                 self._dropped += 1
-            return False
-        with self._lock:
+                return False
             self._enqueued += 1
+            if record["kind"] == "trade":
+                self._trade_events += 1
+            elif record["kind"] == "orderbook":
+                self._orderbook_events += 1
         return True
 
     def record_trade(
@@ -279,6 +365,30 @@ class MarketDataRecorder:
 
     def record_meta(self, event: str, **data: Any) -> bool:
         return self.record("meta", data={"event": str(event), **data})
+
+    def record_session_end(self, **data: Any) -> bool:
+        """Record the final capture-quality snapshot with ``session_end``.
+
+        Callers must stop market streams before invoking this method so no
+        later market event can appear after the session boundary. The snapshot
+        is taken before the session_end record itself is enqueued; replay uses
+        loss/error fields as integrity gates and treats queue counters as
+        diagnostics rather than requiring them to be equal at this instant.
+        """
+        stats = self.stats()
+        payload = dict(data)
+        payload["recorder_stats"] = {
+            "enqueued_before_session_end": stats.enqueued,
+            "written_before_session_end": stats.written,
+            "trade_events_before_session_end": stats.trade_events,
+            "orderbook_events_before_session_end": stats.orderbook_events,
+            "dropped": stats.dropped,
+            "bytes_written_before_session_end": stats.bytes_written,
+            "queue_depth_before_session_end": stats.queue_depth,
+            "segments_finalized_before_session_end": stats.segments_finalized,
+            "last_error": stats.last_error,
+        }
+        return self.record_meta("session_end", **payload)
 
     def _segment_paths(self) -> tuple[Path, Path]:
         self._segment_index += 1
@@ -537,24 +647,52 @@ class MarketDataRecorder:
                     or path.name.endswith(".jsonl.gz")
                 )
             ]
-            finalized.sort(key=lambda path: (path.stat().st_mtime_ns, path.name))
+            pattern = re.compile(
+                rf"^{re.escape(self.config.prefix)}-"
+                r"(?P<session>.+)-(?P<segment>\d{6})\.jsonl(?:\.gz)?$"
+            )
+            grouped: dict[str, list[Path]] = {}
+            for path in finalized:
+                match = pattern.match(path.name)
+                # Unknown legacy names are isolated so retention never treats
+                # them as part of a valid multi-segment recorder session.
+                key = match.group("session") if match else f"legacy:{path.name}"
+                grouped.setdefault(key, []).append(path)
+
+            sessions: list[tuple[str, list[Path], int, bool]] = []
+            for key, paths in grouped.items():
+                newest_mtime = max(path.stat().st_mtime_ns for path in paths)
+                sessions.append(
+                    (key, paths, newest_mtime, key == self._session)
+                )
+            # The active recorder session is always retained. Other sessions
+            # are expired oldest-first as complete units, never segment-by-
+            # segment, because removing segment 1 also removes session_start,
+            # config and universe metadata required for deterministic replay.
+            sessions.sort(key=lambda item: (item[3], item[2], item[0]))
+
             max_files = max(1, int(self.config.max_files))
-            while len(finalized) > max_files:
-                finalized.pop(0).unlink(missing_ok=True)
             max_bytes = max(0, int(self.config.max_total_bytes))
-            if max_bytes <= 0:
-                return
-            total = sum(path.stat().st_size for path in finalized)
-            # Always preserve at least the newest finalized segment even when a
-            # single segment itself exceeds the configured byte budget.
-            while len(finalized) > 1 and total > max_bytes:
-                oldest = finalized.pop(0)
-                try:
-                    size = oldest.stat().st_size
-                except FileNotFoundError:
-                    size = 0
-                oldest.unlink(missing_ok=True)
-                total = max(0, total - size)
+
+            def totals() -> tuple[int, int]:
+                paths = [path for _, items, _, _ in sessions for path in items]
+                total_bytes = 0
+                for path in paths:
+                    try:
+                        total_bytes += path.stat().st_size
+                    except FileNotFoundError:
+                        pass
+                return len(paths), total_bytes
+
+            file_count, total_bytes = totals()
+            while len(sessions) > 1 and (
+                file_count > max_files
+                or (max_bytes > 0 and total_bytes > max_bytes)
+            ):
+                _, oldest_paths, _, _ = sessions.pop(0)
+                for path in oldest_paths:
+                    path.unlink(missing_ok=True)
+                file_count, total_bytes = totals()
         except Exception as exc:
             self._set_error(f"retention failed: {exc}")
 
@@ -563,8 +701,27 @@ class MarketDataRecorder:
             self._last_error = str(message)
 
 
+def _deduplicate_segments(paths: Iterable[Path]) -> list[Path]:
+    """Return one durable file per logical JSONL segment.
+
+    Compression is deliberately crash safe: the gzip is atomically finalized
+    before the source JSONL is removed.  A process crash in that small window
+    can therefore leave both files behind.  Reading both would duplicate every
+    event in the segment, so prefer the finalized gzip for that exact path.
+    """
+    selected: dict[str, Path] = {}
+    for raw_path in paths:
+        path = Path(raw_path)
+        logical = path.with_suffix("") if path.name.endswith(".jsonl.gz") else path
+        key = str(logical)
+        previous = selected.get(key)
+        if previous is None or path.name.endswith(".jsonl.gz"):
+            selected[key] = path
+    return [selected[key] for key in sorted(selected)]
+
+
 def recording_files(directory: Path, prefix: str = "market") -> list[Path]:
-    """Return finalized recording segments in filename order, ignoring parts."""
+    """Return one finalized file per segment, ignoring active parts."""
     directory = Path(directory).expanduser()
     files = [
         path
@@ -575,7 +732,7 @@ def recording_files(directory: Path, prefix: str = "market") -> list[Path]:
             or path.name.endswith(".jsonl.gz")
         )
     ]
-    return sorted(files, key=lambda path: path.name)
+    return _deduplicate_segments(files)
 
 
 def iter_records(
@@ -588,7 +745,7 @@ def iter_records(
         source = Path(files_or_directory)
         files = recording_files(source, prefix) if source.is_dir() else [source]
     else:
-        files = sorted((Path(path) for path in files_or_directory), key=str)
+        files = _deduplicate_segments(Path(path) for path in files_or_directory)
     for path in files:
         opener = gzip.open if path.name.endswith(".gz") else open
         with opener(path, "rt", encoding="utf-8") as handle:

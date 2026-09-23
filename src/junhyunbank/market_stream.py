@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import uuid
@@ -10,8 +11,14 @@ from typing import Any
 import websocket
 
 
+TRANSPORT_AGE_SECONDS_KEY = "_junhyunbank_transport_age_seconds"
+
+
 class MarketStream:
     URL = "wss://api.upbit.com/websocket/v1"
+    DEFAULT_MAX_EVENT_LAG_SECONDS = 3.0
+    DEFAULT_MAX_EVENT_FUTURE_SECONDS = 2.0
+    _DROP_DIAGNOSTIC_INTERVAL_SECONDS = 5.0
     _connect_lock = threading.Lock()
     _last_connect_attempt = 0.0
     _min_connect_interval = 0.25
@@ -26,6 +33,8 @@ class MarketStream:
         on_status: Callable[[dict[str, Any]], None] | None = None,
         orderbook_depth: int = 5,
         name: str = "upbit-websocket",
+        max_event_lag_seconds: float = DEFAULT_MAX_EVENT_LAG_SECONDS,
+        max_event_future_seconds: float = DEFAULT_MAX_EVENT_FUTURE_SECONDS,
     ) -> None:
         self.markets = list(dict.fromkeys(markets))
         self.on_trade = on_trade
@@ -34,11 +43,17 @@ class MarketStream:
         self.on_status = on_status
         self.orderbook_depth = orderbook_depth
         self.name = name
+        self.max_event_lag_seconds = max(0.0, float(max_event_lag_seconds))
+        self.max_event_future_seconds = max(0.0, float(max_event_future_seconds))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_message = 0.0
         self._connected = False
         self._message_count = 0
+        self._stale_drop_count = 0
+        self._invalid_drop_count = 0
+        self._last_data_error = ""
+        self._last_drop_diagnostic = 0.0
         self._last_error = ""
         self._ws: Any | None = None
         self._ws_lock = threading.RLock()
@@ -143,13 +158,134 @@ class MarketStream:
                     "state": state,
                     "connected": self._connected,
                     "markets": len(self.markets),
+                    "market_codes": list(self.markets),
                     "messages": self._message_count,
+                    "stale_drops": self._stale_drop_count,
+                    "invalid_drops": self._invalid_drop_count,
+                    "last_data_error": self._last_data_error,
                     "age_seconds": self.age_seconds,
                     "message": message,
                 }
             )
         except Exception:
             pass
+
+    @staticmethod
+    def event_transport_age_seconds(
+        data: dict[str, Any],
+        *,
+        now_wall: float | None = None,
+    ) -> float | None:
+        """Return exchange-to-local transport age for a public frame."""
+        message_type = str(data.get("type") or "")
+        if message_type == "trade":
+            raw = data.get("trade_timestamp")
+            if raw is None:
+                raw = data.get("timestamp")
+        elif message_type == "orderbook":
+            raw = data.get("timestamp")
+        else:
+            return None
+
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            event_wall = float(raw) / 1000.0
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(event_wall) or event_wall <= 0.0:
+            return None
+
+        wall = time.time() if now_wall is None else float(now_wall)
+        if not math.isfinite(wall):
+            return None
+        return wall - event_wall
+
+    @staticmethod
+    def classify_event_timestamp(
+        data: dict[str, Any],
+        *,
+        now_wall: float | None = None,
+        max_lag_seconds: float = DEFAULT_MAX_EVENT_LAG_SECONDS,
+        max_future_seconds: float = DEFAULT_MAX_EVENT_FUTURE_SECONDS,
+    ) -> str:
+        """Classify an Upbit public frame as ``ok``, ``stale`` or ``invalid``.
+
+        Public event timestamps are Unix milliseconds. A local monotonic receive
+        age alone cannot detect an old frame delivered from an OS/socket backlog,
+        so exchange time is checked before callbacks or freshness are updated.
+        """
+        lag = MarketStream.event_transport_age_seconds(data, now_wall=now_wall)
+        if lag is None:
+            return "invalid"
+        if lag > max(0.0, float(max_lag_seconds)):
+            return "stale"
+        if lag < -max(0.0, float(max_future_seconds)):
+            return "invalid"
+        return "ok"
+
+    def _accept_market_event(
+        self,
+        data: dict[str, Any],
+        *,
+        now_wall: float | None = None,
+    ) -> bool:
+        classification = self.classify_event_timestamp(
+            data,
+            now_wall=now_wall,
+            max_lag_seconds=self.max_event_lag_seconds,
+            max_future_seconds=self.max_event_future_seconds,
+        )
+        if classification == "ok":
+            return True
+
+        if classification == "stale":
+            self._stale_drop_count += 1
+        else:
+            self._invalid_drop_count += 1
+        market = str(data.get("code") or "unknown")
+        message_type = str(data.get("type") or "unknown")
+        self._last_data_error = (
+            f"{market} {message_type} timestamp {classification} · frame discarded"
+        )
+
+        now = time.monotonic()
+        if now - self._last_drop_diagnostic >= self._DROP_DIAGNOSTIC_INTERVAL_SECONDS:
+            self._last_drop_diagnostic = now
+            self._emit_status("data_dropped", self._last_data_error)
+            if self.on_error and not self._stop.is_set():
+                try:
+                    self.on_error(f"WebSocket 시세 폐기: {self._last_data_error}")
+                except Exception:
+                    pass
+        return False
+
+    def _handle_market_event(self, data: dict[str, Any]) -> bool:
+        """Validate and dispatch one public frame.
+
+        Returning a boolean keeps receive-loop behavior directly testable and
+        guarantees rejected exchange timestamps cannot refresh stream health.
+        """
+        received_wall = time.time()
+        received_monotonic = time.monotonic()
+        if not self._accept_market_event(data, now_wall=received_wall):
+            return False
+        transport_age = self.event_transport_age_seconds(
+            data,
+            now_wall=received_wall,
+        )
+        if transport_age is None:
+            return False
+        transport_age = max(0.0, transport_age)
+        data[TRANSPORT_AGE_SECONDS_KEY] = transport_age
+        self._last_message = received_monotonic - transport_age
+        self._message_count += 1
+        message_type = str(data.get("type") or "")
+        if message_type == "trade" and self.on_trade:
+            self.on_trade(data)
+        elif message_type == "orderbook" and self.on_orderbook:
+            self.on_orderbook(data)
+        return True
 
     @classmethod
     def _wait_for_connect_slot(cls) -> None:
@@ -214,13 +350,7 @@ class MarketStream:
                     server_error = self._server_error(data)
                     if server_error:
                         raise RuntimeError(f"Upbit WebSocket {server_error}")
-                    self._last_message = time.monotonic()
-                    self._message_count += 1
-                    message_type = str(data.get("type") or "")
-                    if message_type == "trade" and self.on_trade:
-                        self.on_trade(data)
-                    elif message_type == "orderbook" and self.on_orderbook:
-                        self.on_orderbook(data)
+                    self._handle_market_event(data)
             except Exception as exc:
                 self._connected = False
                 self._last_error = str(exc)

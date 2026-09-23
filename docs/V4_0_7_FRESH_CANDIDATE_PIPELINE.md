@@ -32,7 +32,7 @@ V4.0.0 실사용 캡처에서는 시장 유니버스와 WebSocket 자체는 살�
 
 ## V4.0.7 수정
 
-production `live_engine.TradingEngine`에서 scanner 후보와 실제 entry freshness gate를 정렬합니다.
+V4.3 현재 구현은 `MicroFlowStrategy.select_actionable_deep_markets()`에서 scanner 후보와 실제 entry freshness gate를 정렬하고, production `live_engine.TradingEngine`, Public recorder, forward validator가 이 선택기를 공유합니다. 아래 V4.0.7 규칙은 LIVE에만 따로 복제되지 않습니다.
 
 ### 1. stale 후보 선제 제거
 

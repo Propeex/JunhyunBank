@@ -1,4 +1,24 @@
-# JunhyunBank V4.1.0
+# JunhyunBank V4.3.3
+
+## V4.3.3 — 실전 운용 안전성 전면 보강
+
+V4.3.3은 V4.3.2의 후보 연속성과 활동 화면 개선을 유지하면서, 체결·호가의 순서와 신선도, 워밍업의 실제 관측시간, 시장 목록과 regime 표본, 주문 전 위험예산, 보유 포지션 추적 손절, 잔고 불일치와 주문 상태 기록을 함께 점검했습니다. 잘못되거나 오래된 데이터가 최신 가격과 전략 상태를 덮지 못하게 하고, 근거가 부족한 상황은 신규매수하지 않는 방향으로 바꿨습니다. 중복된 시장 행은 가장 위험한 경보 상태로 합치며 `caution`/`warning`의 `null` 또는 미확인 형식을 정상으로 추정하지 않습니다. `KRW-BTC`의 안전 목록 누락, 전체 또는 안전 허용 KRW 시장 50개 미만, 직전 안전 목록의 70% 미만 급감, 경보 형식 unknown 비율 5% 초과 중 하나라도 발생하면 기존 구독은 청산 감시용으로 유지하되 신규매수는 닫습니다.
+
+주문금액은 더 이상 신호가 강하다는 이유만으로 가용 KRW 대부분까지 커질 수 없습니다. 신호 비중 외에 현금 예비금, 단일·총 노출, 거래당·포트폴리오 손실위험, 최우선호가 표시 유동성 참여율과 세션 손실 중단 조건을 함께 적용합니다. 세션 손실은 입출금이나 사용자의 비관리 자산 등 계정 전체 변동이 아니라, JunhyunBank가 관리한 누적 실현손익과 열린 관리수량의 신선한 실행가능 bid 기준 손익만으로 계산합니다. 실제 Best+IOC처럼 관리수량 전부를 받을 bid 1호가 수량이 부족하면 평가손익을 억지로 추정하지 않고 신규매수를 막습니다. 이는 `1회 N원` 같은 고정 KRW 한도가 아니라 계정 평가액·손절거리·현재 호가에 따라 변하는 안전예산입니다.
+
+시작할 때는 미결 주문, 특히 이전 실행에서 거래소에 도달했을 수 있는 SELL을 먼저 REST로 조정한 뒤 계정과 세션 손익 기준을 만듭니다. 계정 조회나 기준손익 구성이 실패해도 관리 포지션 청산 엔진은 시작하지만, 그 실행 세션의 신규매수는 영구 잠금하며 자동으로 기준을 다시 잡아 매수를 열지 않습니다. 원인을 확인한 뒤 프로그램을 재시작해야 합니다.
+
+LIVE·Public recorder·forward validator는 동일한 fresh actionable 후보 선택기를 사용합니다. recorder와 replay에서는 실제 Hot 후보와 순환 대조군의 역할을 구독 metadata부터 결정·진단까지 분리해, 대조군 호가가 나중의 후보를 미리 워밍업하거나 headline BUY 통계에 섞이지 않게 합니다. 후보 선정 이후 주문 POST까지는 중지 상태, 시장 목록, 전체 체결 스트림, 해당 종목의 체결·호가 신선도를 공통 제출 잠금 안에서 마지막으로 다시 확인합니다. 청산은 한 호가 세대에서 bid·spread·depth를 함께 읽고 보유정책을 판단하며, POST 직전 판단 중 세대가 바뀌면 주문하지 않고 다음 주기에 다시 평가합니다. 느린 화면 때문에 시세 callback 메모리가 계속 늘지 않도록 UI 이벤트도 5,000건 하드 상한과 최신값 병합을 적용합니다.
+
+추적 손절가는 SQLite에 저장해 올라간 뒤 다시 낮아지지 않으며, 최대 보유시간을 명시했습니다. 계정 조회에서 관리수량이 잠시 보이지 않는 경우 즉시 관리 해제하지 않고 반복 확인 후 격리하며, 최소주문 미만 잔량도 삭제하지 않습니다. 자동 청산 주문 전에 포지션의 핵심 회계값이 손상됐음을 발견하면 자동매도를 멈추고 격리합니다. 반대로 이미 체결된 SELL의 KRW 손익은 계산할 수 있지만 outcome 정규화 기준만 손상된 경우에는 별도 durable PnL 조정 원장에 보존해 세션 손실에서 사라지지 않게 합니다. 일반 Best+IOC 주문에는 자기체결방지 `cancel_taker`를 요청합니다.
+
+중요: JunhyunBank가 관리 중인 종목은 업비트 앱이나 다른 프로그램에서 수동 매매하지 마세요. 계정 총수량이 영속 관리수량보다 작아지면 사용자 자산을 잘못 매도하지 않도록 즉시 `QUARANTINED`로 격리하며, 자동으로 소유권을 추정하거나 매도하지 않습니다.
+
+이번 변경은 손실 가능성을 줄이는 방어선이지 수익성 검증이 아닙니다. 거래소 접수까지의 가격 이동, 급격한 갭, 네트워크·프로세스 중단에서는 손절가격보다 불리하게 체결되거나 청산이 늦어질 수 있습니다. `ExpectedMove`도 여전히 방향성 예측이 아닌 절대 변동폭 proxy입니다. 상세 변경·기본값·운영 한계는 [V4.3 실전 운용 강화](docs/V4_3_REAL_WORLD_HARDENING.md)를 확인하세요.
+
+## V4.2.0 — 지속 수급 진입과 시간축 차트
+
+지속적인 매수 우위가 증가를 멈췄다는 이유만으로 진입 점수가 사라지던 조건을 보완했습니다. 차트는 종목 고정 선택, 실제 시간축, 5분·15분·1시간 구간, 보유 평균단가를 지원합니다. 원화 대기 상태와 매수를 막은 비용·시세 조건을 구분해 보여줍니다. 상세 정책과 검증 한계는 [V4.2 진입·차트 보완](docs/V4_2_ENTRY_AND_CHART.md)을 확인하세요.
 
 ## V4.1.0 — 매수 직후 불필요한 청산 방지
 
@@ -16,7 +36,7 @@ V4.0.7은 V4.0.0 실사용에서 보였던 **후보는 많이 잡히는데 종�
 
 기존 scanner의 HotScore 신선도 허용폭은 실제 LIVE 신규매수 stale gate(기본 3초)보다 넓었습니다. 그래서 몇 초 전에 강한 수급이 있었던 시장이 높은 HotScore로 상위 후보와 deep orderbook 슬롯을 차지하면서도, 실제 진입평가에서는 이미 stale로 탈락할 수 있었습니다. 30초 minimum deep residency까지 겹치면 더 아래 순위의 방금 체결된 fresh 시장이 정밀분석 기회를 얻지 못하는 candidate starvation이 생길 수 있었습니다.
 
-V4.0.7은 stale 비관리 후보를 deep 선정 전에 제거하고, top-N 밖의 fresh/warmed 시장을 HotScore 순으로 보충합니다. stale 후보는 30초 residency보다 신선도 조건을 우선해 퇴출하지만, **이미 JunhyunBank가 관리하는 포지션은 청산 감시를 위해 예외적으로 deep monitoring에 계속 유지**합니다. 화면 후보와 runtime candidate count도 실제 fresh actionable 후보에 맞춥니다.
+V4.0.7은 stale 비관리 후보를 deep 선정 전에 제거하고, top-N 밖의 fresh/warmed 시장을 HotScore 순으로 보충합니다. stale 후보는 30초 residency보다 신선도 조건을 우선해 퇴출하지만, **이미 JunhyunBank가 관리하는 포지션은 청산 감시를 위해 예외적으로 deep monitoring에 계속 유지**합니다. 화면 후보와 runtime candidate count도 실제 fresh actionable 후보에 맞춥니다. V4.3에서는 이 선택 규칙을 전략 공용 함수로 옮겨 recorder와 validator도 동일한 후보군을 사용합니다.
 
 이 변경은 아무 코인이나 사게 만드는 것이 아닙니다. IGNITION/PULLBACK 품질, ExpectedMove 대비 비용 gate, Strategy Health, Market Regime, stale 주문차단은 그대로입니다. 즉 **매수 심사 자체에 도달할 수 없는 stale 후보가 슬롯을 독점하는 문제만 제거**합니다.
 
@@ -38,21 +58,21 @@ V4.0.6부터 production `live_engine.TradingEngine`은 BUY는 best ask, SELL은 
 
 V4.0.5는 V4.0.4에서 저장한 raw trade/L2 recording을 **네트워크와 실제 주문 없이** 현재 JH-MicroFlow에 재생하는 offline 검증 계층입니다.
 
-`scripts/replay_strategy.py`는 recorder의 `received_monotonic_ns`를 logical clock으로 사용해 실행 PC 속도와 현재 시각에 영향을 받지 않게 freshness를 재현합니다. 당시 `StrategyConfig`와 안전 KRW universe를 복원하고, orderbook 시점의 feature·entry decision·regime·top-of-book을 기록합니다. 동일 recording, 동일 전략 코드/config/fee이면 canonical decision SHA-256 fingerprint가 동일해야 합니다.
+`scripts/replay_strategy.py`는 recorder의 `received_monotonic_ns`를 logical clock으로 사용해 실행 PC 속도와 현재 시각에 영향을 받지 않게 freshness를 재현합니다. 당시 `StrategyConfig`와 안전 KRW universe를 복원하고, orderbook 시점의 feature·entry decision·regime·top-of-book을 기록합니다. 두 수신시계가 없거나 거래소 timestamp가 당시 수신시각보다 지나치게 과거·미래인 이벤트, 전략이 거부한 이벤트가 있으면 정상 replay로 승인하지 않습니다. 동일 recording, 동일 전략 코드/config/fee이면 canonical decision SHA-256 fingerprint가 동일해야 합니다.
 
 상세: **[V4.0.5 Deterministic Strategy Replay](docs/V4_0_5_DETERMINISTIC_REPLAY.md)**
 
 ## V4.0.4 — Raw market data recorder
 
-`scripts/record_public_market.py`는 API Key 없이 Public REST/WebSocket만 사용해 전체 안전 KRW trade와 현재 Hot 후보의 L2 orderbook을 JSONL로 기록합니다.
+`scripts/record_public_market.py`는 API Key 없이 Public REST/WebSocket만 사용해 전체 안전 KRW trade와 LIVE 정합 fresh actionable 후보 및 순환 비후보 대조군의 L2 orderbook을 JSONL로 기록합니다.
 
-WebSocket callback에서는 bounded queue에 비차단 enqueue만 하고 파일 쓰기·fsync·rotation·gzip은 background worker가 담당합니다. queue 포화는 시세 callback을 막지 않고 drop 통계와 exit code로 드러내며, `.jsonl.part`는 crash 후 마지막 완전한 line까지 복구합니다.
+WebSocket callback에서는 bounded queue에 비차단 enqueue만 하고 파일 쓰기·fsync·rotation·gzip은 background worker가 담당합니다. queue 포화, writer 오류, WebSocket 오류는 시세 callback을 막지 않되 무결성 실패와 종료코드 2로 드러내며, `.jsonl.part`는 crash 후 마지막 완전한 line까지 복구합니다.
 
 상세: **[V4.0.4 Raw Market Data Recorder](docs/V4_0_4_MARKET_RECORDER.md)**
 
 ## V4.0.3 — Read-only forward-edge validator
 
-`scripts/validate_public_edge.py`는 실제 Public trade/orderbook으로 현재 전략을 워밍업하고 후보 시점 entry ask → 미래 bid의 forward net return을 측정합니다. 양쪽 가정 수수료와 spread를 반영하고, 늦은 label은 `missed` 처리하며 시간순 holdout 앞의 overlapping forward horizon을 purge합니다.
+`scripts/validate_public_edge.py`는 실제 Public trade/orderbook으로 현재 전략을 워밍업하고 후보·순환 대조군의 entry ask → 미래 bid forward net return을 분리해 측정합니다. 양쪽 가정 수수료와 spread를 반영하고, 늦은 label은 `missed` 처리하며 시간순 holdout 앞의 overlapping forward horizon을 purge합니다.
 
 API Key와 주문 API를 사용하지 않으며 `orders_submitted: 0`을 명시합니다.
 
@@ -80,17 +100,18 @@ JunhyunBank가 직접 체결해 확보한 **managed quantity만 자동매도**�
 
 전략은 각 코인의 절대값보다 자기 자신의 최근 상태 대비 상대적 이상현상을 봅니다.
 
-- 전체 KRW `trade` WebSocket 감시, Hot 후보만 deep `orderbook` 분석
+- 전체 KRW `trade` WebSocket 감시, LIVE·recorder·validator가 공유하는 fresh actionable 후보만 deep `orderbook` 분석
 - Activity / Aggression / Book Pressure / Momentum rolling percentile
 - 네 요소 geometric mean 기반 Quality
 - IGNITION / PULLBACK CONTINUATION 진입
 - 실제 계정 수수료 + spread + 실행 유동성 비용 gate
 - 시장 Regime과 Strategy Health를 반영한 동적 자금배분
+- 계정 평가액·초기 손절거리·현재 노출·최우선호가 유동성을 함께 반영한 위험예산
 - 고정 `1회 최대 N원`, `시간당 N회`, `최대 N종목` 같은 임의 전략 cap 없음
-- 수급 약화, Adaptive Trailing, entry 시 고정한 Emergency Risk, 기대시간 실패 기반 청산
-- stale trade/orderbook, 반복 API 오류, 경보/해석불가 시장에서는 신규매수 차단
+- 수급 약화, 영속·단방향 Adaptive Trailing, entry 시 고정한 Emergency Risk, 최대 보유시간 기반 청산
+- stale trade/orderbook, 반복 API 오류, 비정상 시장 목록, 경보/해석불가 시장에서는 신규매수 차단
 
-현재 `ExpectedMove`는 조건부 미래 상승 기대수익 모델이 아니라 최근 `|30초 수익률|` 분포 기반의 **절대 변동폭 proxy**입니다. recorder/OOS 근거 없이 threshold를 완화하거나 Kelly류 sizing을 추가하지 않습니다.
+현재 `ExpectedMove`는 조건부 미래 상승 기대수익 모델이 아니라 최근 `|30초 수익률|` 분포 기반의 **절대 변동폭 proxy**입니다. V4.3은 이 값의 자금배분 영향에 상한을 두고 별도 손실위험 예산을 최종 제한으로 사용하지만, 이것이 방향성 edge를 입증하지는 않습니다. recorder/OOS 근거 없이 threshold를 완화하거나 Kelly류 sizing으로 해석하지 않습니다.
 
 ## Best+IOC 유동성 원칙
 
@@ -138,11 +159,11 @@ python launcher.py
 
 Public smoke, forward-edge validator, raw recorder는 실제 Upbit Public API만 사용하고 주문하지 않습니다. deterministic replay는 네트워크 자체를 사용하지 않습니다. Private account WebSocket은 CI에 실계정 API Key를 두지 않으므로 protocol/auth/reconciliation을 mock 회귀테스트로 검증합니다.
 
-`main` 병합 시 GitHub Actions가 Windows/Ubuntu 단위·회귀 테스트와 실제 Upbit Public REST/WebSocket smoke를 통과합니다. Release workflow는 Windows에서 다시 테스트/smoke 후 PyInstaller EXE를 빌드해 package version과 같은 `V4.0.x` Release를 생성합니다.
+`main` 병합 시 GitHub Actions가 Windows/Ubuntu 단위·회귀 테스트와 실제 Upbit Public REST/WebSocket smoke를 수행합니다. Release workflow는 Windows에서 다시 테스트/smoke 후 PyInstaller EXE를 빌드해 package version과 같은 semantic version Release를 생성합니다. CI와 공개시세 smoke는 실제 자금 주문을 수행하지 않습니다.
 
 ## 검증 상태와 다음 단계
 
-코드/실서버 연결 테스트 성공은 수익성 검증을 뜻하지 않습니다. V4.0.3 forward label, V4.0.4 raw recorder, V4.0.5 deterministic replay, V4.0.6 live Best+IOC semantics 정합화, V4.0.7 fresh candidate pipeline으로 **측정 → 저장 → 동일 경로 재현 → 실제 주문 의미 정렬 → 실제 심사 가능한 후보 공급**까지 진행했습니다.
+코드/실서버 연결 테스트 성공은 수익성 검증을 뜻하지 않습니다. V4.3은 잘못된 입력, 과도한 노출, 느슨해지는 추적 손절, 일시적 잔고 불일치 같은 운영 위험을 줄이는 변경입니다. 장기간 여러 시장상태의 기록으로 실행지연·partial/no-fill을 포함한 purged OOS 검증을 통과하기 전에는 실전 수익성을 주장할 수 없습니다.
 
 V4.0.7 이후에도 fresh actionable 후보가 꾸준히 존재하지만 오랜 시간 모든 후보가 `예상 움직임이 거래비용 대비 부족` 또는 품질 기준에서만 탈락한다면, 그때는 pipeline 문제가 아니라 전략 threshold/ExpectedMove의 실효성 문제입니다. 다음 execution simulator와 purged walk-forward/stress에서 이를 검증하고, 충분한 OOS 근거가 있을 때만 조건을 조정합니다.
 
@@ -162,11 +183,11 @@ V4.0.7 이후에도 fresh actionable 후보가 꾸준히 존재하지만 오랜 
 - [`docs/V4_0_5_DETERMINISTIC_REPLAY.md`](docs/V4_0_5_DETERMINISTIC_REPLAY.md)
 - [`docs/V4_0_6_BEST_IOC_EXECUTION_MODEL.md`](docs/V4_0_6_BEST_IOC_EXECUTION_MODEL.md)
 - [`docs/V4_0_7_FRESH_CANDIDATE_PIPELINE.md`](docs/V4_0_7_FRESH_CANDIDATE_PIPELINE.md)
+- [`docs/V4_1_POSITION_POLICY.md`](docs/V4_1_POSITION_POLICY.md)
+- [`docs/V4_2_ENTRY_AND_CHART.md`](docs/V4_2_ENTRY_AND_CHART.md)
+- [`docs/V4_3_REAL_WORLD_HARDENING.md`](docs/V4_3_REAL_WORLD_HARDENING.md)
 - [`docs/STRATEGY_JH_MICROFLOW.md`](docs/STRATEGY_JH_MICROFLOW.md)
 - [`docs/VALIDATION_AND_ROADMAP.md`](docs/VALIDATION_AND_ROADMAP.md)
 - [`docs/UPBIT_INTEGRATION.md`](docs/UPBIT_INTEGRATION.md)
 
 코드와 문서가 충돌하면 현재 `main` 코드가 source of truth입니다.
-# V4.2.0 업데이트
-
-지속적인 매수 우위가 증가를 멈췄다는 이유만으로 진입 점수가 사라지던 조건을 보완했습니다. 차트는 종목 고정 선택, 실제 시간축, 5분·15분·1시간 구간, 보유 평균단가를 지원합니다. 원화 대기 상태와 매수를 막은 비용·시세 조건을 구분해 보여줍니다. [정책·검증·한계](docs/V4_2_ENTRY_AND_CHART.md)

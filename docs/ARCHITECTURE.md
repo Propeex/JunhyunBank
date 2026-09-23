@@ -1,6 +1,6 @@
-# JunhyunBank V2 아키텍처
+# JunhyunBank V4.3 아키텍처
 
-이 문서는 V2의 실제 구현 구조와 각 모듈의 책임을 설명합니다. 설계 의도보다 **현재 코드 동작**을 우선해 기록합니다.
+이 문서는 V4.3의 실제 구현 구조와 각 모듈의 책임을 설명합니다. 설계 의도보다 **현재 코드 동작**을 우선해 기록합니다.
 
 ---
 
@@ -9,7 +9,7 @@
 ```text
 Upbit Public WebSocket
   ├─ trade (전체 KRW)
-  └─ orderbook (Hot 후보 + managed positions)
+  └─ orderbook (fresh actionable 후보 + managed positions)
           │
           ▼
   MarketStream
@@ -27,9 +27,9 @@ Upbit Public WebSocket
   TradingEngine
   ├─ portfolio reconciliation
   ├─ fee / minimum order lookup
-  ├─ liquidity/slippage simulation
+  ├─ Best+IOC top-level capacity / fee+spread cost check
   ├─ Strategy Health
-  ├─ dynamic capital sizing
+  ├─ dynamic risk budgeting
   ├─ order execution
   └─ DRAINING state
           │
@@ -37,7 +37,7 @@ Upbit Public WebSocket
           │
           ├──────────► SQLite Storage
           │
-          └──────────► UI event queue
+          └──────────► bounded/coalesced UI EventBuffer
 ```
 
 별도 축:
@@ -53,8 +53,9 @@ GitHub latest Release
       │
       ├─ old EXE backup
       ├─ new EXE replace
-      ├─ rollback on replacement failure
-      └─ restart (--resume-trading optional)
+      ├─ 새 EXE/DB health verify
+      ├─ 실패 시 EXE+DB snapshot rollback
+      └─ 검증 성공 시 restart (--resume-trading optional)
 ```
 
 ---
@@ -66,7 +67,7 @@ GitHub latest Release
 - QApplication 생성
 - OS keyring에서 API Key 로드
 - 없으면 `ApiKeyDialog`
-- V2는 API Key 없이 PAPER로 진입하지 않고 종료
+- API Key 없이 PAPER로 진입하지 않고 종료
 - 저장된 키로 `get_accounts()`를 호출해 유효성 확인
 - `TradingEngine`, `MainWindow` 생성
 - `--resume-trading`이면 UI 로드 후 자동 `engine.start()`
@@ -91,25 +92,27 @@ UI thread만 담당합니다.
 
 포트폴리오 테이블 첫 행에 KRW를 표시합니다.
 
-엔진과 직접 복잡한 연산을 공유하지 않고 `engine.events` queue를 polling합니다.
+엔진과 직접 복잡한 연산을 공유하지 않고 `engine.events`를 polling합니다. 이 버퍼는 가격·후보·진단 같은 고빈도 상태를 유형/시장별 최신값으로 병합하고 로그성 이벤트는 FIFO로 유지하며, 전체 5,000건 기본 하드 상한을 적용합니다.
 
-### `engine.py`
+### `engine.py` / `runtime_engine.py` / `live_engine.py`
 
-V2의 orchestration 중심입니다.
+거래 lifecycle의 orchestration 계층입니다. `runtime_engine.py`가 market discovery와 stream lifecycle을, production `live_engine.py`가 Best+IOC pre-trade 의미를 확정합니다.
 
 책임:
 
-- market universe 갱신
+- 대표시장·크기·직전 대비 유지율·경보 schema를 검사하는 market universe 갱신
 - public stream 생성/재시작
 - managed positions를 deep orderbook 구독에 강제 포함
 - 주기적 portfolio refresh
 - 전략 후보 랭킹
 - entry/exit 평가
 - fee/minimum lookup cache
-- 호가 기반 예상 slippage/capacity 계산
+- Best+IOC 최우선 한 가격단계 capacity와 수수료·spread 기반 비용 계산
 - 주문 제출 및 주문 결과 polling
 - managed quantity 영속화
 - Strategy Health 적용
+- 관리전략 전용 실현·평가손익 기반 세션 손실 gate
+- 정지와 주문 POST를 직렬화하는 submission gate 및 최종 데이터 재확인
 - RUNNING / DRAINING / STOPPED lifecycle
 
 ### `strategy.py`
@@ -133,9 +136,7 @@ V2의 orchestration 중심입니다.
 
 ### `risk.py`
 
-이름과 달리 투자전략의 position sizing을 담당하지 않습니다.
-
-V2에서 RiskManager는 **시스템 안전 게이트**입니다.
+V4.3의 RiskManager는 **시스템 안전 게이트와 손실위험 기반 신규주문 예산**을 담당합니다.
 
 차단 조건:
 
@@ -144,8 +145,12 @@ V2에서 RiskManager는 **시스템 안전 게이트**입니다.
 - stale market data
 - 동적 주문금액이 exchange minimum 미만
 - available cash 부족
+- 관리전략 전용 세션 손실 중단조건
+- 현금 예비금, 단일·총 암호자산 노출
+- 초기 손절거리 기반 거래당·포트폴리오 계획위험
+- 최우선호가 표시 유동성 참여율
 
-고정 주문금액, 일일손실률, 최대포지션 수, 고정 stop-loss는 없습니다.
+`1회 N원`, `시간당 N회`, `최대 N종목` 같은 임의의 고정 전략 cap은 없습니다. 대신 계정 평가액과 현재 시장상태에 비례하는 안전상한을 사용합니다. 계획위험은 갭·API 장애 때 실제 손실을 보장하지 않습니다.
 
 ### `storage.py`
 
@@ -158,7 +163,9 @@ SQLite 영속성 담당.
 - events
 - trades
 - managed positions
-- strategy outcomes
+- normalized health와 별도 net KRW 손익을 가진 strategy outcomes
+- outcome 정규화 기준은 손상됐지만 실현손익은 계산 가능한 SELL을 위한 `strategy_pnl_adjustments` 원장과 exchange order UUID 기반 중복 방지
+- order submit/accept 시각, persisted trailing stop, managed status/absence state
 
 실시간 raw trade/orderbook은 현재 영속화하지 않습니다.
 
@@ -171,9 +178,9 @@ REST + JWT client.
 - query/body가 있으면 SHA512 query hash
 - private request serialization lock
 - 약 11 req/s 내부 rate guard
-- 429 retry, 418 error
+- GET timeout/429/5xx 제한 재시도, POST no-retry, 418 error
 - accounts, tickers, market list, order chance, order status
-- best IOC buy/sell
+- SMP `cancel_taker`를 포함한 best IOC buy/sell
 - market buy/sell fallback method
 
 ### `market_stream.py`
@@ -184,8 +191,9 @@ public WebSocket client.
 - `orderbook`
 - timeout 시 ping
 - disconnect 시 exponential backoff reconnect
+- 거래소 timestamp stale/future event 차단
 
-현재 private WebSocket은 사용하지 않습니다.
+Private WebSocket은 `private_stream.py`에서 `myOrder`/`myAsset` 보조 신호로 사용하며 회계 정본은 identifier REST입니다.
 
 ### `updater.py`
 
@@ -219,9 +227,9 @@ API Key / DB는 실행파일 밖에 있으므로 교체 대상이 아닙니다.
 
 오래 거래가 없는 gap이 baseline 길이보다 길면 과거 frame/book history를 버립니다.
 
-### Hot 후보 orderbook
+### Fresh actionable 후보 orderbook
 
-전체 trade에서 HotScore를 계산하고 상위 `deep_candidate_count`만 orderbook을 구독합니다.
+전체 trade에서 HotScore를 계산한 뒤 live stale 기준으로 비관리 후보를 거르고, 잘린 scanner 목록 밖의 fresh 시장을 보충합니다. 신선한 기존 deep 후보에는 최소 체류시간과 교체 margin을 적용하며, 이 선택기는 LIVE·recorder·validator가 공유합니다. 최종 후보 중 `deep_candidate_count`를 orderbook 정밀분석 대상으로 사용합니다.
 
 단, JunhyunBank managed position은 Hot 후보가 아니어도 deep stream에 반드시 포함합니다.
 
@@ -230,6 +238,20 @@ API Key / DB는 실행파일 밖에 있으므로 교체 대상이 아닙니다.
 ---
 
 ## 4. 엔진 loop
+
+시작 순서는 다음과 같습니다.
+
+```text
+pending 주문(특히 SELL) identifier REST reconciliation
+  ↓
+계정 조회
+  ↓
+관리전략 실현·평가손익 baseline 구성
+  ↓
+engine thread 시작
+```
+
+계정 조회나 손익 baseline 구성이 실패해도 관리 포지션 청산 엔진은 시작합니다. 다만 해당 실행 세션의 신규매수는 영구 잠금하며, 원인을 확인하고 프로그램을 재시작하기 전에 자동 rebase하여 매수를 다시 열지 않습니다.
 
 엔진 thread는 대략 다음 cadence로 동작합니다.
 
@@ -276,9 +298,9 @@ BUY 후보 score 순 정렬
   ↓
 desired KRW = remaining cash × capital_fraction
   ↓
-orderbook liquidity capacity 계산
+Best+IOC ask1·bid1 즉시 체결 capacity와 위험예산 계산
   ↓
-buy + sell slippage simulation
+실제 계정 수수료 + spread 비용 확인
   ↓
 expected move > actual cost × 2 확인
   ↓
@@ -307,31 +329,29 @@ actual executed volume / avg fill price 저장
 
 각 managed market:
 
-1. account position 존재 여부 확인
+1. account position 존재 여부와 반복 누락 상태 확인
 2. persisted `managed_quantity` 읽기
-3. current/entry/peak 가격 구성
+3. 한 orderbook generation의 fresh bid·spread·depth·수신시각으로 실행호가와 current/entry/peak 가격 구성
 4. fee + spread 기반 round trip cost 재계산
 5. 진입 시 저장된 `initial_risk_pct` 사용
 6. `strategy.evaluate_position()`
-7. SELL이면 `_sell_managed()`
+7. 새 trailing stop을 SQLite에 ratchet 저장
+8. SELL이면 submission gate 안에서 한 generation의 실행호가로 보유정책 전체를 최종 재평가
+9. 재평가 중 generation token이 바뀌지 않았고 최종 판단도 SELL일 때만 `_sell_managed()`
 
 ### managed quantity
 
-매도수량:
+계정 총수량이 영속 `managed_quantity`보다 작으면 소유권을 안전하게 판별할 수 없으므로 `QUARANTINED`로 격리하고 주문하지 않습니다. 총수량이 관리수량 이상일 때만 매도 주문수량을 다음과 같이 제한합니다.
 
 ```text
 min(persisted managed_quantity, currently available balance)
 ```
 
-을 사용합니다.
-
 이것이 사용자의 기존 보유분 보호의 핵심입니다.
 
 ### dust
 
-관리 잔여수량의 원화가치가 최소 주문금액 아래로 내려가면 현재 구현은 해당 market을 자동관리에서 해제합니다.
-
-이 dust 정책은 이후 버전에서 별도 표시/정리 정책을 개선할 수 있습니다.
+관리 잔여수량의 원화가치가 최소 주문금액 아래면 `DUST`로 보존합니다. 단, 계정 총수량은 충분하고 잠금 때문에 현재 주문 가능 수량의 가치만 최소주문 미만이면 `DUST`로 오인하지 않고 `ACTIVE`로 유지합니다. 한 번의 accounts 누락으로 관리 해제하지 않으며 반복 누락은 `QUARANTINED`로 격리합니다. 두 상태 모두 계정 총잔고를 managed quantity로 추정하지 않고 DRAINING의 자동처리 대기대상에서는 제외합니다.
 
 ---
 
@@ -376,7 +396,7 @@ UI의 업데이트 버튼은 별도 worker thread에서 GitHub Release 조회/�
 
 그 후 PowerShell helper가 부모 EXE 종료를 기다리고 파일을 교체합니다.
 
-현재 rollback은 **파일 교체 자체가 실패하는 상황**을 대상으로 합니다. 새 EXE가 정상적으로 뜬 뒤 런타임 오류를 일으키는 경우까지 자동 health-check 후 rollback하는 구조는 아직 없습니다.
+새 EXE는 별도 검증 모드에서 DB migration, 무결성, 필수 테이블과 health marker를 확인합니다. 실패하면 EXE와 업데이트 직전 DB snapshot을 함께 복원하며 자동매매를 자동 재개하지 않습니다.
 
 ---
 
@@ -390,7 +410,7 @@ UI의 업데이트 버튼은 별도 worker thread에서 GitHub Release 조회/�
 
 SQLite method는 내부 lock으로 보호합니다.
 
-`MicroFlowStrategy`는 trade/orderbook stream thread에서 쓰고 engine thread에서 읽습니다. Python 객체 operation의 GIL에 상당 부분 의존하며 별도 strategy-level lock/snapshot consistency는 없습니다. 향후 고성능화 또는 free-threaded Python 대응 시 동기화 모델을 명시적으로 개선할 수 있습니다.
+`MicroFlowStrategy`는 trade/orderbook stream thread에서 쓰고 engine thread에서 읽는 상태 갱신과 주요 평가를 내부 `RLock`과 동기화 wrapper로 보호합니다. `book()`은 lock 안에서 한 번 게시된 `BookSnapshot`을 반환하며, 청산 경로는 이 한 snapshot에서 bid·depth·spread·수신시각을 함께 만듭니다. 안전에 중요한 판단에서는 `book()`과 별도 age getter를 조합하지 않고 하나의 `ExecutableQuote`와 generation token을 사용합니다.
 
 ---
 
@@ -408,6 +428,8 @@ SQLite method는 내부 lock으로 보호합니다.
 
 - API Key: keyring에서 복구
 - managed positions: SQLite에서 복구
+- pending 주문은 계정·세션 기준을 만들기 전 identifier REST로 먼저 reconciliation
+- 계정 또는 관리전략 PnL baseline 확인 실패 시 청산은 유지하되 해당 세션 신규매수는 재시작 전까지 영구 잠금
 - 전략 rolling market state: **복구하지 않음**, 다시 warmup
 - managed position emergency stop: persisted initial risk를 활용할 수 있지만 current market price가 들어와야 판단 가능
 
@@ -419,14 +441,12 @@ SQLite method는 내부 lock으로 보호합니다.
 
 ## 11. 설계상 다음 개선 포인트
 
-- private `myOrder` / `myAsset` WebSocket
-- durable order state machine + ambiguity reconciliation
-- raw market data recorder
-- replay simulator/backtester
+- Best+IOC latency/partial/no-fill execution simulator
+- recorder 장기간 데이터와 purged walk-forward/OOS
+- conditional directional ExpectedMove
 - portfolio correlation risk
 - strategy state snapshot/persistence
 - structured observability/metrics
-- update 후 새 EXE 정상기동 확인 + automatic rollback health-check
-- dust/reconciliation UI
+- quarantined/dust operator reconciliation UI
 
 상세 우선순위는 `VALIDATION_AND_ROADMAP.md`를 참조합니다.
