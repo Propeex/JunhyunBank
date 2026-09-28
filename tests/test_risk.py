@@ -111,3 +111,40 @@ def test_entry_budget_rejects_non_finite_inputs():
 
     assert not result.allowed
     assert result.amount_krw == 0
+
+
+def test_all_in_budget_uses_complete_available_cash_when_liquidity_is_deep():
+    risk = RiskManager(_budget_config(all_in_cash_entries=True))
+
+    result = _entry_budget(
+        risk,
+        available_cash_krw=1_000_000,
+        liquidity_capacity_krw=20_000_000,
+    )
+
+    assert result.allowed
+    assert result.amount_krw == pytest.approx(1_000_000)
+    assert result.limiting_factor == "all_in_cash"
+
+
+def test_all_in_budget_never_shrinks_order_to_fit_thin_liquidity():
+    risk = RiskManager(_budget_config(all_in_cash_entries=True))
+
+    result = _entry_budget(
+        risk,
+        available_cash_krw=1_000_000,
+        liquidity_capacity_krw=9_999_999,
+    )
+
+    assert not result.allowed
+    assert result.amount_krw == pytest.approx(1_000_000)
+    assert result.limiting_factor == "all_in_liquidity"
+
+
+def test_all_in_budget_refuses_second_position():
+    risk = RiskManager(_budget_config(all_in_cash_entries=True))
+
+    result = _entry_budget(risk, gross_exposure_krw=1.01)
+
+    assert not result.allowed
+    assert result.limiting_factor == "all_in_existing_exposure"

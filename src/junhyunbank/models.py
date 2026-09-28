@@ -14,6 +14,7 @@ class SignalKind(str, Enum):
     NONE = "NONE"
     IGNITION = "IGNITION"
     PULLBACK = "PULLBACK"
+    MICRO_SCALP = "MICRO_SCALP"
 
 
 class EngineState(str, Enum):

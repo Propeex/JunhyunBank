@@ -6,7 +6,7 @@ from test_strategy import _features, _book
 
 
 def strategy(rate, count=360):
-    s=MicroFlowStrategy(StrategyConfig())
+    s=MicroFlowStrategy(StrategyConfig(micro_scalp_enabled=False))
     frames=[]
     for i in range(count):
         p=100*(1+rate)**i

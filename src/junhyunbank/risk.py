@@ -113,6 +113,40 @@ class RiskManager:
                 "session_drawdown",
             )
 
+        if bool(getattr(self.config, "all_in_cash_entries", False)):
+            minimum = max(self.config.min_order_krw, min_order_krw)
+            if gross_exposure_krw > max(1.0, equity_krw * 1e-9):
+                return EntryBudget(
+                    False,
+                    0.0,
+                    "현금 전액 모드는 기존 자산 보유 중 추가 진입하지 않음",
+                    "all_in_existing_exposure",
+                )
+            participation = _fraction(
+                getattr(self.config, "liquidity_participation_fraction", 0.10)
+            )
+            liquidity_limit = liquidity_capacity_krw * participation
+            if available_cash_krw > liquidity_limit:
+                return EntryBudget(
+                    False,
+                    available_cash_krw,
+                    "최우선 매수·매도 호가가 현금 전액 주문을 충분히 소화하지 못함",
+                    "all_in_liquidity",
+                )
+            if available_cash_krw < minimum:
+                return EntryBudget(
+                    False,
+                    available_cash_krw,
+                    "현금 전액이 업비트 최소 주문금액보다 작음",
+                    "all_in_minimum",
+                )
+            return EntryBudget(
+                True,
+                available_cash_krw,
+                "가용 현금 전액 주문 가능",
+                "all_in_cash",
+            )
+
         reserve = _fraction(
             getattr(self.config, "cash_reserve_fraction", 0.15)
         )

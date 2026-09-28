@@ -26,6 +26,10 @@ class SafetyConfig:
     market_universe_min_retained_fraction: float = 0.70
     market_unknown_alert_fraction: float = 0.05
     event_buffer_max_items: int = 5_000
+    # V4.4 ultra-scalp policy. When enabled, an accepted entry uses all
+    # currently available KRW (less the exchange fee reserved by the engine).
+    # It is still all-or-nothing with respect to the liquidity gate.
+    all_in_cash_entries: bool = True
 
 
 @dataclass(slots=True)
@@ -35,11 +39,11 @@ class StrategyConfig:
     min_warmup_trade_seconds: int = 60
     scanner_candidate_count: int = 30
     deep_candidate_count: int = 24
-    candidate_refresh_seconds: float = 3.0
+    candidate_refresh_seconds: float = 1.0
     deep_min_residency_seconds: float = 30.0
     deep_switch_margin: float = 4.0
     market_refresh_seconds: float = 300.0
-    evaluation_seconds: float = 1.0
+    evaluation_seconds: float = 0.25
     portfolio_publish_seconds: float = 1.0
     runtime_health_seconds: float = 1.0
     no_candidate_warning_seconds: float = 300.0
@@ -61,6 +65,15 @@ class StrategyConfig:
     exit_confirmation_seconds: float = 5.0
     exit_pressure_deadband: float = 0.10
     max_holding_seconds: float = 900.0
+    # Cost-aware dip/rebound micro-scalping.
+    micro_scalp_enabled: bool = True
+    micro_scalp_window_seconds: int = 24
+    micro_scalp_min_turns: int = 5
+    micro_scalp_min_quality: float = 0.68
+    micro_scalp_low_zone_fraction: float = 0.45
+    micro_scalp_min_net_profit_pct: float = 0.0001
+    micro_scalp_max_stop_pct: float = 0.006
+    micro_scalp_max_holding_seconds: float = 90.0
 
 
 @dataclass(slots=True)

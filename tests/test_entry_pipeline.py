@@ -23,6 +23,9 @@ class Exchange:
 
 
 def feed(strategy):
+    # This fixture exercises the pre-V4.4 ignition pipeline. Dedicated strategy
+    # tests cover the default MICRO_SCALP entry pattern.
+    strategy.config.micro_scalp_enabled = False
     for i in range(240):
         price=100*(1+.01*math.sin(i/10))
         if i>=230:
@@ -49,6 +52,7 @@ def test_raw_trade_and_book_signal_reaches_buy_and_persists_fill(tmp_path):
     allow_fixture_regime(engine)
     engine._evaluate_cycle()
     assert len(client.orders)==1
+    assert client.orders[0][1] == 99_950
     assert engine.storage.get_managed_state('KRW-X')['managed_quantity']==100
     assert not engine.storage.pending_orders()
 

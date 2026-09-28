@@ -547,6 +547,45 @@ class MicroFlowStrategy:
         f = self._trade_features(self._series(market))
         if not f:
             return 0.0
+        if self.config.micro_scalp_enabled:
+            frames = self._series(market)
+            window = max(8, int(self.config.micro_scalp_window_seconds))
+            recent = frames[-window:]
+            raw_one_second = [
+                value
+                for value in self._returns(frames, 1)[-window:]
+                if math.isfinite(value)
+            ]
+            one_second = [value for value in raw_one_second if value != 0.0]
+            if len(recent) < window or len(one_second) < max(8, window // 2):
+                return 0.0
+            signs = [1 if value > 0 else -1 for value in one_second]
+            turns = sum(
+                1 for left, right in zip(signs, signs[1:]) if left != right
+            )
+            low = min(frame.low for frame in recent)
+            high = max(frame.high for frame in recent)
+            current = recent[-1].close
+            if low <= 0 or high <= low or current <= 0:
+                return 0.0
+            location = (current - low) / (high - low)
+            down_leg = sum(raw_one_second[-5:-1])
+            if (
+                turns < max(2, int(self.config.micro_scalp_min_turns))
+                or location > _clamp(self.config.micro_scalp_low_zone_fraction)
+                or not raw_one_second
+                or raw_one_second[-1] <= 0
+                or down_leg >= 0
+                or f["aggression"] < -self.config.exit_pressure_deadband
+            ):
+                return 0.0
+            turn_quality = _clamp(turns / max(1.0, window / 2.0))
+            low_quality = _clamp(1.0 - location)
+            return (
+                0.45 * _clamp(f["activity_q"])
+                + 0.35 * turn_quality
+                + 0.20 * low_quality
+            ) * 100.0
         required = (
             f["activity_q"],
             f["aggression_q"],
@@ -800,6 +839,72 @@ class MicroFlowStrategy:
         short = self._returns(frames, 3)
         return bool(short and short[-1] > 0)
 
+    def _micro_scalp_setup(
+        self, market: str, *, round_trip_cost_pct: float
+    ) -> tuple[float, float] | None:
+        """Return expected rebound and setup quality for a dip/rebound cycle.
+
+        A falling tick alone is deliberately insufficient. Full-cash entry is
+        permitted only after the recent tape has oscillated in both directions,
+        price is still in the lower part of that range, and the latest completed
+        second confirms a rebound after a negative leg.
+        """
+        window = max(8, int(self.config.micro_scalp_window_seconds))
+        frames = self._series(market)
+        if len(frames) < window + 1:
+            return None
+        recent_frames = frames[-window:]
+        raw_one_second = [
+            value
+            for value in self._returns(frames, 1)[-window:]
+            if math.isfinite(value)
+        ]
+        one_second = [value for value in raw_one_second if value != 0.0]
+        if len(one_second) < max(8, window // 2):
+            return None
+        signs = [1 if value > 0 else -1 for value in one_second]
+        turns = sum(1 for left, right in zip(signs, signs[1:]) if left != right)
+        if turns < max(2, int(self.config.micro_scalp_min_turns)):
+            return None
+        if sum(value > 0 for value in one_second) < 3 or sum(
+            value < 0 for value in one_second
+        ) < 3:
+            return None
+
+        low = min(frame.low for frame in recent_frames)
+        high = max(frame.high for frame in recent_frames)
+        current = recent_frames[-1].close
+        if low <= 0 or high <= low or current <= 0:
+            return None
+        range_pct = high / low - 1.0
+        location = (current - low) / (high - low)
+        if location > _clamp(self.config.micro_scalp_low_zone_fraction):
+            return None
+
+        if (
+            not raw_one_second
+            or raw_one_second[-1] <= 0
+            or not any(value < 0 for value in raw_one_second[-5:-1])
+        ):
+            return None
+        down_leg = sum(raw_one_second[-5:-1])
+        if down_leg >= 0:
+            return None
+
+        expected_rebound = high / current - 1.0
+        minimum_edge = max(0.0, round_trip_cost_pct) * 2.0
+        if range_pct <= minimum_edge or expected_rebound <= minimum_edge:
+            return None
+
+        turn_quality = _clamp(turns / max(1.0, window / 2.0))
+        low_quality = _clamp(1.0 - location)
+        rebound_quality = _clamp(
+            raw_one_second[-1] / max(abs(down_leg), round_trip_cost_pct, 1e-9)
+        )
+        return expected_rebound, (
+            0.45 * turn_quality + 0.35 * low_quality + 0.20 * rebound_quality
+        )
+
     @synchronized
     def evaluate_entry(
         self,
@@ -843,6 +948,79 @@ class MicroFlowStrategy:
                 "예상 움직임이 거래비용 대비 부족",
                 expected_move_pct=expected_move,
                 round_trip_cost_pct=cost,
+            )
+
+        if self.config.micro_scalp_enabled:
+            if market in self._blocked_after_exit:
+                return StrategyDecision(
+                    Signal.HOLD,
+                    quality * 100.0,
+                    "이전 초단타 주기가 아직 초기화되지 않음",
+                    expected_move_pct=expected_move,
+                    round_trip_cost_pct=cost,
+                )
+            setup = self._micro_scalp_setup(
+                market, round_trip_cost_pct=cost
+            )
+            if setup is None:
+                return StrategyDecision(
+                    Signal.HOLD,
+                    quality * 100.0,
+                    "초단타 대기: 반복 진동·저점 반등·비용 여유 미확인",
+                    expected_move_pct=expected_move,
+                    round_trip_cost_pct=cost,
+                )
+            expected_rebound, setup_quality = setup
+            if setup_quality < _clamp(self.config.micro_scalp_min_quality):
+                return StrategyDecision(
+                    Signal.HOLD,
+                    setup_quality * 100.0,
+                    "초단타 대기: 반복 진동 품질 부족",
+                    expected_move_pct=expected_rebound,
+                    round_trip_cost_pct=cost,
+                )
+            if f["aggression"] < -self.config.exit_pressure_deadband or f[
+                "imbalance"
+            ] < -self.config.exit_pressure_deadband:
+                return StrategyDecision(
+                    Signal.HOLD,
+                    setup_quality * 100.0,
+                    "초단타 대기: 반등 직후 매도압력/매도호가 우세",
+                    expected_move_pct=expected_rebound,
+                    round_trip_cost_pct=cost,
+                )
+            stop = max(cost * 1.8, min(expected_move, expected_rebound))
+            max_stop = max(0.0, self.config.micro_scalp_max_stop_pct)
+            if max_stop <= 0 or cost * 1.8 > max_stop:
+                return StrategyDecision(
+                    Signal.HOLD,
+                    setup_quality * 100.0,
+                    "초단타 대기: 거래비용 대비 허용 손절폭 부족",
+                    expected_move_pct=expected_rebound,
+                    round_trip_cost_pct=cost,
+                )
+            stop = min(stop, max_stop)
+            horizon = max(
+                5.0,
+                min(
+                    float(self.config.micro_scalp_max_holding_seconds),
+                    float(self.config.micro_scalp_window_seconds) * 2.0,
+                ),
+            )
+            return StrategyDecision(
+                Signal.BUY,
+                setup_quality * 100.0,
+                (
+                    "MICRO_SCALP · 반복 진동 후 저점 반등 · "
+                    f"예상 반등 {expected_rebound:.3%} / 비용 {cost:.3%}"
+                ),
+                kind=SignalKind.MICRO_SCALP,
+                expected_move_pct=expected_rebound,
+                round_trip_cost_pct=cost,
+                initial_risk_pct=stop,
+                capital_fraction=1.0,
+                expected_horizon_seconds=horizon,
+                hold_quality=setup_quality,
             )
 
         kind = (
@@ -960,6 +1138,7 @@ class MicroFlowStrategy:
         elapsed_seconds: float,
         expected_horizon_seconds: float,
         trailing_stop_price: float = 0.0,
+        signal_kind: str = "NONE",
     ) -> StrategyDecision:
         numeric = (
             entry_price,
@@ -985,6 +1164,28 @@ class MicroFlowStrategy:
                 f"Emergency Stop {pnl:+.2%}",
                 trailing_stop_price=persisted_stop,
             )
+        is_micro_scalp = str(signal_kind).endswith(SignalKind.MICRO_SCALP.value)
+        if is_micro_scalp:
+            target = max(0.0, round_trip_cost_pct) + max(
+                0.0, self.config.micro_scalp_min_net_profit_pct
+            )
+            if pnl >= target:
+                return StrategyDecision(
+                    Signal.SELL,
+                    100.0,
+                    f"초단타 비용후 목표 달성 {pnl:+.3%} >= {target:.3%}",
+                    kind=SignalKind.MICRO_SCALP,
+                    trailing_stop_price=persisted_stop,
+                )
+            scalp_horizon = max(1.0, self.config.micro_scalp_max_holding_seconds)
+            if elapsed_seconds >= scalp_horizon:
+                return StrategyDecision(
+                    Signal.SELL,
+                    0.0,
+                    f"초단타 최대 보유시간 {scalp_horizon:.0f}초 도달",
+                    kind=SignalKind.MICRO_SCALP,
+                    trailing_stop_price=persisted_stop,
+                )
         if persisted_stop > 0 and current_price <= persisted_stop:
             return StrategyDecision(
                 Signal.SELL,

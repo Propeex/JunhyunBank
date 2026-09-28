@@ -1208,6 +1208,7 @@ class TradingEngine(OrderExecution):
                     elapsed_seconds=elapsed,
                     expected_horizon_seconds=horizon,
                     trailing_stop_price=trailing_stop,
+                    signal_kind=str(state.get("signal_kind") or "NONE"),
                 )
                 if decision.trailing_stop_price > trailing_stop:
                     self.storage.update_managed_trailing_stop(market, decision.trailing_stop_price)
@@ -1251,6 +1252,7 @@ class TradingEngine(OrderExecution):
                         trailing_stop_price=max(
                             trailing_stop, decision.trailing_stop_price
                         ),
+                        signal_kind=str(state.get("signal_kind") or "NONE"),
                     )
                     if final_decision.trailing_stop_price > trailing_stop:
                         self.storage.update_managed_trailing_stop(
@@ -1315,6 +1317,7 @@ class TradingEngine(OrderExecution):
                                 decision.trailing_stop_price,
                                 final_decision.trailing_stop_price,
                             ),
+                            signal_kind=str(state.get("signal_kind") or "NONE"),
                         )
                         if guard_decision.trailing_stop_price > trailing_stop:
                             self.storage.update_managed_trailing_stop(

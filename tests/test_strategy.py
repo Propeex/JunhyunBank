@@ -2,7 +2,7 @@ import time
 
 from junhyunbank.config import StrategyConfig
 from junhyunbank.market_stream import TRANSPORT_AGE_SECONDS_KEY
-from junhyunbank.models import Signal
+from junhyunbank.models import Signal, SignalKind
 from junhyunbank.strategy import BookSnapshot, MicroFlowStrategy
 
 
@@ -107,7 +107,9 @@ def test_cost_gate_rejects_signal_without_net_room():
 
 
 def test_high_quality_relative_signal_can_buy():
-    strategy = MicroFlowStrategy(StrategyConfig(ignition_quality=0.7))
+    strategy = MicroFlowStrategy(
+        StrategyConfig(ignition_quality=0.7, micro_scalp_enabled=False)
+    )
     strategy._feature_set = lambda market: _features(expected_move=0.02)
     strategy._books["KRW-TEST"] = _book()
     strategy._is_pullback = lambda market, expected: False
@@ -336,6 +338,126 @@ def _feed_prices(strategy, prices):
                 "sequential_id": second + 1,
             }
         )
+
+
+def test_micro_scalp_enters_only_after_oscillating_dip_starts_rebounding():
+    config = StrategyConfig(
+        micro_scalp_enabled=True,
+        micro_scalp_window_seconds=24,
+        micro_scalp_min_turns=5,
+    )
+    strategy = MicroFlowStrategy(config)
+    prices = [100.0, 100.2, 99.9, 100.15, 99.85, 100.1, 99.8] * 4
+    prices += [100.0, 99.8, 99.6, 99.5, 99.55]
+    _feed_prices(strategy, prices)
+    strategy._feature_set = lambda market: _features(
+        expected_move=0.006, quality=0.9
+    )
+    strategy._books["KRW-X"] = _book()
+
+    decision = strategy.evaluate_entry(
+        "KRW-X",
+        bid_fee=0.0005,
+        ask_fee=0.0005,
+        health=1.0,
+        regime_factor=1.0,
+    )
+
+    assert decision.signal == Signal.BUY
+    assert decision.kind == SignalKind.MICRO_SCALP
+    assert decision.capital_fraction == 1.0
+    assert decision.initial_risk_pct <= config.micro_scalp_max_stop_pct
+
+
+def test_micro_scalp_pattern_is_discoverable_by_trade_only_scanner():
+    config = StrategyConfig(
+        min_warmup_seconds=24,
+        min_warmup_trade_seconds=20,
+        long_momentum_window_seconds=10,
+        micro_scalp_enabled=True,
+        micro_scalp_window_seconds=24,
+        micro_scalp_min_turns=5,
+    )
+    strategy = MicroFlowStrategy(config)
+    prices = [100.0, 100.2, 99.9, 100.15, 99.85, 100.1, 99.8] * 4
+    prices += [100.0, 99.8, 99.6, 99.5, 99.55]
+
+    _feed_prices(strategy, prices)
+
+    assert strategy.hot_score("KRW-X") > 0
+
+
+def test_micro_scalp_never_catches_a_still_falling_price():
+    config = StrategyConfig(
+        micro_scalp_enabled=True,
+        micro_scalp_window_seconds=24,
+        micro_scalp_min_turns=5,
+    )
+    strategy = MicroFlowStrategy(config)
+    prices = [100.0, 100.2, 99.9, 100.15, 99.85, 100.1, 99.8] * 4
+    prices += [100.0, 99.8, 99.6, 99.5, 99.4]
+    _feed_prices(strategy, prices)
+    strategy._feature_set = lambda market: _features(
+        expected_move=0.006, quality=0.9
+    )
+    strategy._books["KRW-X"] = _book()
+
+    decision = strategy.evaluate_entry(
+        "KRW-X",
+        bid_fee=0.0005,
+        ask_fee=0.0005,
+        health=1.0,
+        regime_factor=1.0,
+    )
+
+    assert decision.signal == Signal.HOLD
+
+
+def test_micro_scalp_requires_latest_second_to_be_a_real_positive_rebound():
+    config = StrategyConfig(
+        micro_scalp_enabled=True,
+        micro_scalp_window_seconds=24,
+        micro_scalp_min_turns=5,
+    )
+    strategy = MicroFlowStrategy(config)
+    prices = [100.0, 100.2, 99.9, 100.15, 99.85, 100.1, 99.8] * 4
+    prices += [100.0, 99.8, 99.6, 99.5, 99.5]
+    _feed_prices(strategy, prices)
+    strategy._feature_set = lambda market: _features(
+        expected_move=0.006, quality=0.9
+    )
+    strategy._books["KRW-X"] = _book()
+
+    decision = strategy.evaluate_entry(
+        "KRW-X",
+        bid_fee=0.0005,
+        ask_fee=0.0005,
+        health=1.0,
+        regime_factor=1.0,
+    )
+
+    assert decision.signal == Signal.HOLD
+
+
+def test_micro_scalp_exits_as_soon_as_cost_plus_net_target_is_reached():
+    strategy = MicroFlowStrategy(
+        StrategyConfig(micro_scalp_min_net_profit_pct=0.0001)
+    )
+
+    decision = strategy.evaluate_position(
+        "KRW-X",
+        entry_price=100.0,
+        current_price=100.12,
+        peak_price=100.12,
+        initial_risk_pct=0.005,
+        round_trip_cost_pct=0.001,
+        elapsed_seconds=2.0,
+        expected_horizon_seconds=30.0,
+        signal_kind="MICRO_SCALP",
+    )
+
+    assert decision.signal == Signal.SELL
+    assert "비용후 목표 달성" in decision.reason
 
 
 def test_pullback_requires_advance_before_peak_before_retracement():
