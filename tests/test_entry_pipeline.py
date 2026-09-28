@@ -57,6 +57,44 @@ def test_raw_trade_and_book_signal_reaches_buy_and_persists_fill(tmp_path):
     assert not engine.storage.pending_orders()
 
 
+def test_micro_scalp_uses_local_setup_when_broad_regime_is_insufficient(
+    tmp_path, monkeypatch
+):
+    client = Exchange()
+    engine = TradingEngine(client, storage=Storage(tmp_path / 'local-regime.db'))
+    engine._state = EngineState.RUNNING
+    engine._allowed_markets = ['KRW-X']
+    feed(engine.strategy)
+    engine.config.strategy.micro_scalp_enabled = True
+    engine._deep_markets = ['KRW-X']
+    engine._market_discovery_ready = True
+
+    monkeypatch.setattr(
+        engine.strategy, 'market_regime', lambda _: ('DATA_INSUFFICIENT', 0.0)
+    )
+    monkeypatch.setattr(engine, '_global_market_data_ready', lambda: False)
+    monkeypatch.setattr(engine.health_governor, 'score', lambda _: 0.0)
+    monkeypatch.setattr(
+        engine.strategy, 'rank_markets', lambda markets, limit: [('KRW-X', 1.0)]
+    )
+    seen = []
+
+    def evaluate(*args, **kwargs):
+        seen.append(kwargs)
+        return StrategyDecision(Signal.HOLD, 0.0, 'local setup checked')
+
+    monkeypatch.setattr(engine.strategy, 'evaluate_entry', evaluate)
+    engine._evaluate_cycle()
+
+    assert seen, engine.drain_events()
+    assert seen[0]['health'] == 1.0
+    assert seen[0]['regime_factor'] == 1.0
+    assert not any(
+        'DATA_INSUFFICIENT' in event.get('reason', '')
+        for event in engine.drain_events()
+    )
+
+
 def test_same_raw_signal_with_unaffordable_cost_submits_nothing(tmp_path):
     client=Exchange()
     client.get_order_chance=lambda market:{'bid_fee':'.1','ask_fee':'.1'}

@@ -1381,12 +1381,20 @@ class TradingEngine(OrderExecution):
                     '관리 전략 손익을 신선한 실행호가로 계산할 수 없어 신규 매수 차단',
                 )
                 return
+            local_micro_scalp = bool(
+                self.config.strategy.micro_scalp_enabled
+                and self.config.strategy.micro_scalp_local_regime_only
+            )
             drawdown_limit = max(
                 0.0, self.config.safety.session_drawdown_halt_fraction
             )
-            if drawdown_limit > 0 and session_return <= -drawdown_limit:
+            if (
+                not local_micro_scalp
+                and drawdown_limit > 0
+                and session_return <= -drawdown_limit
+            ):
                 self._session_drawdown_halted = True
-            if self._session_drawdown_halted:
+            if not local_micro_scalp and self._session_drawdown_halted:
                 self._entry_status(
                     '전체',
                     (
@@ -1396,16 +1404,19 @@ class TradingEngine(OrderExecution):
                 )
                 return
             health = self.health_governor.score(self.storage.strategy_outcomes(self.config.strategy.health_lookback)); regime_name, regime_factor = self.strategy.market_regime(self._allowed_markets)
+            entry_health = 1.0 if local_micro_scalp else health
+            entry_regime_factor = 1.0 if local_micro_scalp else regime_factor
+            entry_session_return = 0.0 if local_micro_scalp else session_return
             self.events.put({"type": "strategy_health", "health": health, "regime": regime_name})
             if pending:
                 self._entry_status('전체', f'미확정 주문 {len(pending)}건 확인 중 · 신규 매수 차단'); return
             if not getattr(self, '_market_discovery_ready', True):
                 self._entry_status('전체', '시장 경보 목록 갱신 실패 · 재확인 전 신규 매수 차단'); return
-            if not self._global_market_data_ready():
+            if not local_micro_scalp and not self._global_market_data_ready():
                 self._entry_status('전체', '전체 체결 스트림 일부가 끊겼거나 지연됨 · 시장 국면 신뢰성 복구 전 신규 매수 차단'); return
-            if health <= 0:
+            if not local_micro_scalp and health <= 0:
                 self._entry_status('전체', '전략 건강도 0 · 최근 실거래 손실로 신규 매수 중단 · 성과 검토 필요'); return
-            if regime_factor <= 0:
+            if not local_micro_scalp and regime_factor <= 0:
                 self._entry_status('전체', f'시장 국면 {regime_name} · 신규 매수 차단'); return
             if not self._deep_markets:
                 self._entry_status('전체', '진입 후보 대기 · 시세 연결/3분 워밍업 상태를 확인하세요.'); return
@@ -1437,7 +1448,7 @@ class TradingEngine(OrderExecution):
                 fee_info = self._fee_info(market)
                 if not fee_info: continue
                 bid_fee, ask_fee, _, _ = fee_info
-                decision = self.strategy.evaluate_entry(market, bid_fee=bid_fee, ask_fee=ask_fee, health=health, regime_factor=regime_factor)
+                decision = self.strategy.evaluate_entry(market, bid_fee=bid_fee, ask_fee=ask_fee, health=entry_health, regime_factor=entry_regime_factor)
                 self._entry_status(market, decision.reason, score=decision.score,
                                    expected_move_pct=decision.expected_move_pct, cost_pct=decision.round_trip_cost_pct)
                 if decision.signal == Signal.BUY: decisions.append((market, decision, fee_info))
@@ -1464,7 +1475,7 @@ class TradingEngine(OrderExecution):
                 if self._state != EngineState.RUNNING or self.risk.emergency or self.storage.pending_orders(): return
                 # Earlier candidates may have waited behind fee lookups or
                 # another order. Fresh quotes alone do not keep an old signal valid.
-                decision = self.strategy.evaluate_entry(market, bid_fee=fee_info[0], ask_fee=fee_info[1], health=health, regime_factor=regime_factor)
+                decision = self.strategy.evaluate_entry(market, bid_fee=fee_info[0], ask_fee=fee_info[1], health=entry_health, regime_factor=entry_regime_factor)
                 if decision.signal != Signal.BUY:
                     self._entry_status(market, f'주문 직전 재확인: {decision.reason}', score=decision.score,
                                        expected_move_pct=decision.expected_move_pct, cost_pct=decision.round_trip_cost_pct)
@@ -1481,7 +1492,7 @@ class TradingEngine(OrderExecution):
                     initial_risk_pct=planned_risk,
                     liquidity_capacity_krw=capacity,
                     signal_fraction=decision.capital_fraction,
-                    session_return_pct=session_return,
+                    session_return_pct=entry_session_return,
                     min_order_krw=min_bid,
                 )
                 if not budget.allowed:
@@ -1510,7 +1521,7 @@ class TradingEngine(OrderExecution):
                         initial_risk_pct=actual_risk,
                         liquidity_capacity_krw=capacity,
                         signal_fraction=decision.capital_fraction,
-                        session_return_pct=session_return,
+                        session_return_pct=entry_session_return,
                         min_order_krw=min_bid,
                     )
                     if not budget.allowed:
@@ -1552,8 +1563,8 @@ class TradingEngine(OrderExecution):
                         market,
                         bid_fee=bid_fee,
                         ask_fee=ask_fee,
-                        health=health,
-                        regime_factor=regime_factor,
+                        health=entry_health,
+                        regime_factor=entry_regime_factor,
                     )
                     if guard_decision.signal != Signal.BUY:
                         self._entry_status(

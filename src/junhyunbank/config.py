@@ -74,6 +74,10 @@ class StrategyConfig:
     micro_scalp_min_net_profit_pct: float = 0.0001
     micro_scalp_max_stop_pct: float = 0.006
     micro_scalp_max_holding_seconds: float = 90.0
+    # MICRO_SCALP selects locally oscillating markets. Broad-market regime and
+    # historical strategy-health filters describe a different time horizon and
+    # must not veto a valid local setup.
+    micro_scalp_local_regime_only: bool = True
 
 
 @dataclass(slots=True)
