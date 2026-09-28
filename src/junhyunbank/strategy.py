@@ -550,41 +550,38 @@ class MicroFlowStrategy:
         if self.config.micro_scalp_enabled:
             frames = self._series(market)
             window = max(8, int(self.config.micro_scalp_window_seconds))
-            recent = frames[-window:]
             raw_one_second = [
                 value
                 for value in self._returns(frames, 1)[-window:]
                 if math.isfinite(value)
             ]
             one_second = [value for value in raw_one_second if value != 0.0]
-            if len(recent) < window or len(one_second) < max(8, window // 2):
+            # Candidate discovery runs before deep orderbook subscription.  It
+            # should keep oscillating markets under observation instead of
+            # demanding the exact one-second dip/rebound entry instant here.
+            # The stricter low-zone chronology, live rebound, book pressure
+            # and cost gates remain in ``_micro_scalp_setup/evaluate_entry``.
+            if len(frames) < window or len(one_second) < max(6, window // 4):
                 return 0.0
             signs = [1 if value > 0 else -1 for value in one_second]
             turns = sum(
                 1 for left, right in zip(signs, signs[1:]) if left != right
             )
-            low = min(frame.low for frame in recent)
-            high = max(frame.high for frame in recent)
-            current = recent[-1].close
-            if low <= 0 or high <= low or current <= 0:
+            candidate_turns = max(
+                2, int(self.config.micro_scalp_min_turns) - 2
+            )
+            up_moves = sum(1 for value in one_second if value > 0)
+            down_moves = len(one_second) - up_moves
+            if turns < candidate_turns or min(up_moves, down_moves) < 2:
                 return 0.0
-            location = (current - low) / (high - low)
-            down_leg = sum(raw_one_second[-5:-1])
-            if (
-                turns < max(2, int(self.config.micro_scalp_min_turns))
-                or location > _clamp(self.config.micro_scalp_low_zone_fraction)
-                or not raw_one_second
-                or raw_one_second[-1] <= 0
-                or down_leg >= 0
-                or f["aggression"] < -self.config.exit_pressure_deadband
-            ):
-                return 0.0
-            turn_quality = _clamp(turns / max(1.0, window / 2.0))
-            low_quality = _clamp(1.0 - location)
+            turn_quality = _clamp(turns / max(1.0, candidate_turns * 2.0))
+            two_sided_quality = _clamp(
+                2.0 * min(up_moves, down_moves) / max(1.0, len(one_second))
+            )
             return (
-                0.45 * _clamp(f["activity_q"])
+                0.50 * _clamp(f["activity_q"])
                 + 0.35 * turn_quality
-                + 0.20 * low_quality
+                + 0.15 * two_sided_quality
             ) * 100.0
         required = (
             f["activity_q"],

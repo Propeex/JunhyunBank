@@ -387,6 +387,37 @@ def test_micro_scalp_pattern_is_discoverable_by_trade_only_scanner():
     assert strategy.hot_score("KRW-X") > 0
 
 
+def test_micro_scalp_scanner_tracks_oscillation_before_entry_rebound_exists():
+    config = StrategyConfig(
+        min_warmup_seconds=24,
+        min_warmup_trade_seconds=20,
+        long_momentum_window_seconds=10,
+        micro_scalp_enabled=True,
+        micro_scalp_window_seconds=24,
+        micro_scalp_min_turns=5,
+    )
+    strategy = MicroFlowStrategy(config)
+    prices = [100.0, 100.2, 99.9, 100.15, 99.85, 100.1, 99.8] * 5
+    prices += [100.0, 99.8, 99.6, 99.5, 99.4]
+    _feed_prices(strategy, prices)
+
+    # A still-falling final second is not an entry, but the oscillating market
+    # must already be in the deep-orderbook pool so the next rebound is seen.
+    assert strategy.hot_score("KRW-X") > 0
+    strategy._feature_set = lambda market: _features(
+        expected_move=0.006, quality=0.9
+    )
+    strategy._books["KRW-X"] = _book()
+    decision = strategy.evaluate_entry(
+        "KRW-X",
+        bid_fee=0.0005,
+        ask_fee=0.0005,
+        health=1.0,
+        regime_factor=1.0,
+    )
+    assert decision.signal == Signal.HOLD
+
+
 def test_micro_scalp_never_catches_a_still_falling_price():
     config = StrategyConfig(
         micro_scalp_enabled=True,

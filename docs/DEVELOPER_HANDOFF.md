@@ -1,4 +1,4 @@
-# JunhyunBank 개발 인수인계 — V4.4.1 기준
+# JunhyunBank 개발 인수인계 — V4.4.2 기준
 
 V4.3의 입력 검증, 위험예산, 영속 추적손절, managed state 격리와 검증 한계는 [V4.3 실전 운용 강화](V4_3_REAL_WORLD_HARDENING.md)를 먼저 읽으세요. V4.1의 진입·보유 판단 분리와 V4.2의 지속 수급 진입·차트 보완도 계속 적용됩니다.
 
