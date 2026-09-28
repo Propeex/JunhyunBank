@@ -369,6 +369,39 @@ def test_micro_scalp_enters_only_after_oscillating_dip_starts_rebounding():
     assert decision.initial_risk_pct <= config.micro_scalp_max_stop_pct
 
 
+def test_micro_scalp_uses_rebound_edge_instead_of_generic_double_cost_gate():
+    strategy = MicroFlowStrategy(
+        StrategyConfig(
+            micro_scalp_enabled=True,
+            micro_scalp_window_seconds=24,
+            micro_scalp_min_turns=3,
+        )
+    )
+    prices = [100.0, 100.2, 99.9, 100.15, 99.85, 100.1, 99.8] * 4
+    prices += [100.0, 99.8, 99.6, 99.5, 99.55]
+    _feed_prices(strategy, prices)
+    # The generic feature move is below 2x cost, but the observed rebound room
+    # clears round-trip cost plus the configured net-profit target.
+    strategy._feature_set = lambda market: _features(
+        expected_move=0.001, quality=0.9
+    )
+    strategy._books["KRW-X"] = _book()
+
+    decision = strategy.evaluate_entry(
+        "KRW-X",
+        bid_fee=0.0005,
+        ask_fee=0.0005,
+        health=1.0,
+        regime_factor=1.0,
+    )
+
+    assert decision.signal == Signal.BUY
+    assert decision.expected_move_pct > (
+        decision.round_trip_cost_pct
+        + strategy.config.micro_scalp_min_net_profit_pct
+    )
+
+
 def test_micro_scalp_pattern_is_discoverable_by_trade_only_scanner():
     config = StrategyConfig(
         min_warmup_seconds=24,

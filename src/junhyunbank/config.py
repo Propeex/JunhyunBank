@@ -18,7 +18,7 @@ class SafetyConfig:
     gross_exposure_fraction: float = 0.60
     per_trade_risk_fraction: float = 0.0025
     portfolio_risk_fraction: float = 0.01
-    liquidity_participation_fraction: float = 0.10
+    liquidity_participation_fraction: float = 0.50
     session_drawdown_halt_fraction: float = 0.02
     managed_absence_confirmations: int = 3
     managed_quote_fallback_seconds: float = 2.0
@@ -68,11 +68,11 @@ class StrategyConfig:
     # Cost-aware dip/rebound micro-scalping.
     micro_scalp_enabled: bool = True
     micro_scalp_window_seconds: int = 24
-    micro_scalp_min_turns: int = 5
-    micro_scalp_min_quality: float = 0.68
-    micro_scalp_low_zone_fraction: float = 0.45
+    micro_scalp_min_turns: int = 3
+    micro_scalp_min_quality: float = 0.50
+    micro_scalp_low_zone_fraction: float = 0.65
     micro_scalp_min_net_profit_pct: float = 0.0001
-    micro_scalp_max_stop_pct: float = 0.006
+    micro_scalp_max_stop_pct: float = 0.010
     micro_scalp_max_holding_seconds: float = 90.0
     # MICRO_SCALP selects locally oscillating markets. Broad-market regime and
     # historical strategy-health filters describe a different time horizon and

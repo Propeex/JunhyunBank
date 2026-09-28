@@ -857,15 +857,15 @@ class MicroFlowStrategy:
             if math.isfinite(value)
         ]
         one_second = [value for value in raw_one_second if value != 0.0]
-        if len(one_second) < max(8, window // 2):
+        if len(one_second) < max(6, window // 4):
             return None
         signs = [1 if value > 0 else -1 for value in one_second]
         turns = sum(1 for left, right in zip(signs, signs[1:]) if left != right)
         if turns < max(2, int(self.config.micro_scalp_min_turns)):
             return None
-        if sum(value > 0 for value in one_second) < 3 or sum(
+        if sum(value > 0 for value in one_second) < 2 or sum(
             value < 0 for value in one_second
-        ) < 3:
+        ) < 2:
             return None
 
         low = min(frame.low for frame in recent_frames)
@@ -889,7 +889,9 @@ class MicroFlowStrategy:
             return None
 
         expected_rebound = high / current - 1.0
-        minimum_edge = max(0.0, round_trip_cost_pct) * 2.0
+        minimum_edge = max(0.0, round_trip_cost_pct) + max(
+            0.0, self.config.micro_scalp_min_net_profit_pct
+        )
         if range_pct <= minimum_edge or expected_rebound <= minimum_edge:
             return None
 
@@ -924,29 +926,6 @@ class MicroFlowStrategy:
         move_window = max(1, self.config.expected_move_window_seconds)
         spread = f["spread_pct"]
         cost = max(0.0, bid_fee) + max(0.0, ask_fee) + spread * 1.5
-        # Use the shortest observed horizon that covers the same cost gate.
-        # Longer horizons need at least one full window of historical returns.
-        if expected_move <= cost * 2.0:
-            frames = self._series(market)
-            for window in (60, 120):
-                if window <= move_window:
-                    continue
-                returns = [abs(r) for r in self._returns(frames, window) if math.isfinite(r)]
-                if len(returns) < window:
-                    continue
-                observed = _quantile(returns[-900:], .70)
-                if observed > cost * 2.0:
-                    expected_move, move_window = observed, window
-                    break
-        if expected_move <= cost * 2.0:
-            return StrategyDecision(
-                Signal.HOLD,
-                quality * 100.0,
-                "예상 움직임이 거래비용 대비 부족",
-                expected_move_pct=expected_move,
-                round_trip_cost_pct=cost,
-            )
-
         if self.config.micro_scalp_enabled:
             if market in self._blocked_after_exit:
                 return StrategyDecision(
@@ -976,7 +955,7 @@ class MicroFlowStrategy:
                     expected_move_pct=expected_rebound,
                     round_trip_cost_pct=cost,
                 )
-            if f["aggression"] < -self.config.exit_pressure_deadband or f[
+            if f["aggression"] < -self.config.exit_pressure_deadband and f[
                 "imbalance"
             ] < -self.config.exit_pressure_deadband:
                 return StrategyDecision(
@@ -986,9 +965,9 @@ class MicroFlowStrategy:
                     expected_move_pct=expected_rebound,
                     round_trip_cost_pct=cost,
                 )
-            stop = max(cost * 1.8, min(expected_move, expected_rebound))
+            stop = max(cost * 1.25, min(expected_move, expected_rebound))
             max_stop = max(0.0, self.config.micro_scalp_max_stop_pct)
-            if max_stop <= 0 or cost * 1.8 > max_stop:
+            if max_stop <= 0 or cost * 1.25 > max_stop:
                 return StrategyDecision(
                     Signal.HOLD,
                     setup_quality * 100.0,
@@ -1018,6 +997,28 @@ class MicroFlowStrategy:
                 capital_fraction=1.0,
                 expected_horizon_seconds=horizon,
                 hold_quality=setup_quality,
+            )
+
+        # Longer-horizon entries retain the wider two-times-cost margin.
+        if expected_move <= cost * 2.0:
+            frames = self._series(market)
+            for window in (60, 120):
+                if window <= move_window:
+                    continue
+                returns = [abs(r) for r in self._returns(frames, window) if math.isfinite(r)]
+                if len(returns) < window:
+                    continue
+                observed = _quantile(returns[-900:], .70)
+                if observed > cost * 2.0:
+                    expected_move, move_window = observed, window
+                    break
+        if expected_move <= cost * 2.0:
+            return StrategyDecision(
+                Signal.HOLD,
+                quality * 100.0,
+                "예상 움직임이 거래비용 대비 부족",
+                expected_move_pct=expected_move,
+                round_trip_cost_pct=cost,
             )
 
         kind = (

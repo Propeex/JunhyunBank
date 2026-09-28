@@ -15,7 +15,7 @@ from .config import AppConfig
 from .execution import OrderExecution
 from .health import StrategyHealthGovernor
 from .market_stream import MarketStream
-from .models import EngineState, Position, Signal
+from .models import EngineState, Position, Signal, SignalKind, StrategyDecision
 from .risk import RiskManager
 from .storage import Storage
 from .strategy import BookSnapshot, MicroFlowStrategy
@@ -1013,6 +1013,18 @@ class TradingEngine(OrderExecution):
             capacity += price * size
         return capacity
 
+    def _entry_clears_cost(self, decision: StrategyDecision, cost_pct: float) -> bool:
+        if decision.kind == SignalKind.MICRO_SCALP:
+            required = cost_pct + max(
+                0.0, self.config.strategy.micro_scalp_min_net_profit_pct
+            )
+            return decision.expected_move_pct > required
+        return decision.expected_move_pct > cost_pct * 2.0
+
+    @staticmethod
+    def _entry_cost_risk_multiplier(decision: StrategyDecision) -> float:
+        return 1.25 if decision.kind == SignalKind.MICRO_SCALP else 1.8
+
     @staticmethod
     def _entry_book_token(book: BookSnapshot) -> tuple[Any, ...]:
         """Identify one coherent entry-orderbook generation."""
@@ -1483,7 +1495,11 @@ class TradingEngine(OrderExecution):
                 bid_fee, ask_fee, min_bid, _ = fee_info; book = self.strategy.book(market)
                 if not book: continue
                 capacity = self._liquidity_capacity(book, expected_move_pct=decision.expected_move_pct, bid_fee=bid_fee, ask_fee=ask_fee)
-                planned_risk = max(decision.initial_risk_pct, decision.round_trip_cost_pct * 1.8)
+                risk_multiplier = self._entry_cost_risk_multiplier(decision)
+                planned_risk = max(
+                    decision.initial_risk_pct,
+                    decision.round_trip_cost_pct * risk_multiplier,
+                )
                 budget = self.risk.entry_budget(
                     equity_krw=equity,
                     available_cash_krw=cash_remaining,
@@ -1511,7 +1527,7 @@ class TradingEngine(OrderExecution):
                 amount = min(budget.amount_krw, cash_remaining / (1.0 + bid_fee))
                 buy_slip, fillable = self._simulate_buy_slippage(book, amount); sell_slip, _ = self._simulate_sell_slippage(book, amount); amount = min(amount, fillable)
                 actual_cost = bid_fee + ask_fee + book.spread_pct + buy_slip + sell_slip
-                actual_risk = max(planned_risk, actual_cost * 1.8)
+                actual_risk = max(planned_risk, actual_cost * risk_multiplier)
                 if actual_risk > planned_risk:
                     budget = self.risk.entry_budget(
                         equity_krw=equity,
@@ -1539,7 +1555,7 @@ class TradingEngine(OrderExecution):
                         continue
                     amount = min(amount, budget.amount_krw)
                 amount = math.floor(amount)
-                if amount <= 0 or decision.expected_move_pct <= actual_cost * 2.0:
+                if amount <= 0 or not self._entry_clears_cost(decision, actual_cost):
                     self._entry_status(market, '실제 호가 유동성/왕복 거래비용 조건 미달', amount_krw=amount, cost_pct=actual_cost); continue
                 check = self.risk.can_open(available_cash=cash_remaining, amount_krw=amount, min_order_krw=min_bid, stream_age_seconds=max(self.strategy.trade_age(market), self.strategy.book_age(market)))
                 if not check.allowed:
@@ -1616,12 +1632,21 @@ class TradingEngine(OrderExecution):
                         + guard_buy_slip
                         + guard_sell_slip
                     )
-                    guard_risk = max(
-                        guard_decision.initial_risk_pct, guard_cost * 1.8
+                    guard_risk_multiplier = self._entry_cost_risk_multiplier(
+                        guard_decision
                     )
+                    guard_risk = max(
+                        guard_decision.initial_risk_pct,
+                        guard_cost * guard_risk_multiplier,
+                    )
+                    risk_worsened = guard_risk > planned_actual_risk + 1e-12
+                    if guard_decision.kind == SignalKind.MICRO_SCALP:
+                        risk_worsened = guard_risk > max(
+                            0.0, self.config.strategy.micro_scalp_max_stop_pct
+                        )
                     if (
-                        guard_decision.expected_move_pct <= guard_cost * 2.0
-                        or guard_risk > planned_actual_risk + 1e-12
+                        not self._entry_clears_cost(guard_decision, guard_cost)
+                        or risk_worsened
                     ):
                         self._entry_status(
                             market,
